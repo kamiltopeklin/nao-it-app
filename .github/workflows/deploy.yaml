@@ -1,0 +1,182 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          # Default is 10m; pip + npm + vite on the CPX21 often exceeds that.
+          command_timeout: 30m
+          # Pass token so the VPS can fetch a private HTTPS remote without prompts.
+          envs: GITHUB_TOKEN
+
+          script: |
+            set -e
+
+            cd /opt/showerv3
+
+            echo "Pulling latest code..."
+            # Repo remote is HTTPS with no stored credentials; authenticate via Actions token.
+            REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/daniellwang08-del/showerv3.git"
+            git fetch --force "$REPO_URL" "+refs/heads/main:refs/remotes/origin/main"
+            git reset --hard origin/main
+
+            echo "Activating virtual environment..."
+            source venv/bin/activate
+
+            echo "Installing Python dependencies..."
+            # torch first from the CPU index so sentence-transformers never
+            # pulls the multi-GB CUDA bundle onto the VPS.
+            pip install torch --index-url https://download.pytorch.org/whl/cpu
+            pip install -r requirements.txt
+
+            echo "Pre-downloading embedding model (cached under ./model_cache)..."
+            python -c "from dotenv import load_dotenv; load_dotenv('.env'); from app.services.encoding_service import get_embedding_model; get_embedding_model()" || echo "model pre-download failed; encoding worker will retry at startup"
+
+            echo "Running database migrations..."
+            alembic upgrade head
+
+            echo "Building frontend..."
+            cd frontend
+            npm install
+            npm run build
+            cd ..
+
+            echo "Restarting API..."
+            systemctl restart showerv3-api
+
+            echo "Restarting workers..."
+            systemctl restart showerv3-worker@extraction
+            systemctl restart showerv3-worker@analysis
+            systemctl restart showerv3-worker@tailoring
+            systemctl restart showerv3-worker@save
+            systemctl restart showerv3-worker@resume
+            systemctl restart showerv3-worker@autopost
+
+            echo "Starting encoding worker (vector match engine)..."
+            systemctl enable showerv3-worker@encoding || true
+            systemctl restart showerv3-worker@encoding
+
+            echo "Waiting for in-flight scrapes before restarting scraper worker..."
+            # Rolling restart mid-crawl cancels run_scraper_task and showed a false
+            # "Cancelled or timed out" banner even when scrape_runs already succeeded.
+            # NOTE: heredoc body must stay indented at the script block's minimum
+            # indent so YAML does not end `script: |` early (GitHub Actions parse error).
+            # Closing PY must use that same minimum indent so bash sees it at column 0
+            # after YAML strips the common leading whitespace.
+            DBURL=$(grep -E '^DATABASE_URL=' .env | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+            DBURL=$(echo "$DBURL" | sed 's/postgresql+asyncpg/postgresql/' | sed 's/+asyncpg//')
+            for i in $(seq 1 120); do
+              running=$(DBURL="$DBURL" python - <<'PY'
+            from sqlalchemy import create_engine, text
+            import os
+            url = os.environ["DBURL"]
+            try:
+                e = create_engine(url)
+                with e.connect() as c:
+                    n = c.execute(text("SELECT count(*) FROM scrape_runs WHERE status = 'running'")).scalar() or 0
+                print(int(n))
+            except Exception:
+                print(0)
+            PY
+              )
+              if [ "$running" = "0" ]; then
+                echo "No running scrape_runs — safe to restart scraper."
+                break
+              fi
+              echo "  $running scrape_run(s) still running; waiting (attempt $i/120)..."
+              sleep 5
+            done
+
+            systemctl restart showerv3-worker@scraper
+
+            echo "Applying nginx security hardening (TLS-safe conf.d drop-in)..."
+            # Installs only an http-scope drop-in (security headers + auth
+            # rate-limit zone). It never replaces the certbot-managed vhost, so
+            # TLS stays intact. Fully guarded: a bad config restores every file
+            # touched here, keeps the previous nginx config, and never fails the deploy.
+            #
+            # Pre-rebrand servers carry atomspace-hardening.conf, and their live
+            # vhosts reference zone=atomspace_auth. Both must move together:
+            # leaving the old drop-in duplicates every security header, and
+            # dropping it alone leaves the vhosts pointing at a missing zone.
+            # Only the zone name inside the vhost is edited; TLS blocks are untouched.
+            if [ -d /etc/nginx/conf.d ]; then
+              LEGACY_DROPIN=/etc/nginx/conf.d/atomspace-hardening.conf
+              NGINX_BACKUP=$(mktemp -d)
+              LEGACY_VHOSTS=$(grep -rlE 'zone=atomspace_auth\b' /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null | xargs -r readlink -f | sort -u || true)
+              [ -f "$LEGACY_DROPIN" ] && cp "$LEGACY_DROPIN" "$NGINX_BACKUP/legacy-dropin.conf"
+              for f in $LEGACY_VHOSTS; do
+                cp "$f" "$NGINX_BACKUP/$(echo "$f" | tr / _)"
+                sed -i 's/zone=atomspace_auth\b/zone=nao_auth/' "$f"
+                echo "Migrated rate-limit zone in $f"
+              done
+              rm -f "$LEGACY_DROPIN"
+              cp deploy/nginx/conf.d/nao-hardening.conf /etc/nginx/conf.d/nao-hardening.conf || true
+              if nginx -t; then
+                systemctl reload nginx || echo "nginx reload failed; previous config still serving"
+              else
+                echo "nginx -t failed; reverting drop-in and vhost changes, keeping previous config"
+                rm -f /etc/nginx/conf.d/nao-hardening.conf || true
+                [ -f "$NGINX_BACKUP/legacy-dropin.conf" ] && cp "$NGINX_BACKUP/legacy-dropin.conf" "$LEGACY_DROPIN"
+                for f in $LEGACY_VHOSTS; do
+                  cp "$NGINX_BACKUP/$(echo "$f" | tr / _)" "$f" || true
+                done
+              fi
+              rm -rf "$NGINX_BACKUP"
+            else
+              echo "no /etc/nginx/conf.d; skipping nginx hardening"
+            fi
+
+            echo "Ensuring logs.nao.it.com nginx site is installed..."
+            # Install HTTP vhost only when missing. Never overwrite after certbot
+            # has rewritten the live file with TLS listen blocks.
+            if [ -d /etc/nginx/sites-available ]; then
+              LOGS_AVAIL=/etc/nginx/sites-available/logs.nao
+              LOGS_SRC=deploy/nginx/logs.atomspace.it.com.conf
+              if [ -f "$LOGS_SRC" ] && [ ! -f "$LOGS_AVAIL" ]; then
+                cp "$LOGS_SRC" "$LOGS_AVAIL"
+                ln -sfn "$LOGS_AVAIL" /etc/nginx/sites-enabled/logs.nao
+                if nginx -t; then
+                  systemctl reload nginx || echo "nginx reload failed after logs site install"
+                  echo "Installed logs.nao.it.com HTTP site (run certbot for TLS)."
+                else
+                  echo "nginx -t failed after logs site install; removing"
+                  rm -f /etc/nginx/sites-enabled/logs.nao "$LOGS_AVAIL"
+                fi
+              else
+                echo "logs.nao site already present or source missing, left unchanged"
+              fi
+            fi
+
+            echo "Waiting for startup..."
+            sleep 10
+
+            echo "Health check..."
+            # Runs on the VPS, so resolve the hostname locally instead of through
+            # DNS: a stale entry in the box's resolver cache would otherwise fail
+            # a deploy whose app is perfectly healthy. The first call checks the
+            # API process, the second the full nginx + TLS path.
+            curl --fail http://127.0.0.1:8000/api/v1/health
+            curl --fail --resolve nao.it.com:443:127.0.0.1 https://nao.it.com/api/v1/health
+
+            echo "Deployment successful."

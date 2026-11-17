@@ -1,0 +1,272 @@
+"""
+Convert user profile data to OpenAI-optimized text format.
+Produces a resume-style document for use as context in Chat Completions.
+"""
+
+import re
+from typing import Any
+
+from app.utils.flexible_date import format_flexible_date, format_flexible_period
+
+
+def _s(obj: Any, key: str, default: str = "") -> str:
+    """Safe string getter for dict or object."""
+    if obj is None:
+        return default
+    val = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+    if val is None:
+        return default
+    return str(val).strip() if isinstance(val, str) else str(val)
+
+
+def _list(obj: Any, key: str) -> list:
+    """Safe list getter for dict or object."""
+    if obj is None:
+        return []
+    val = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+    if val is None:
+        return []
+    return list(val) if isinstance(val, (list, tuple)) else []
+
+
+def _format_period(start: str, end: str) -> str:
+    return format_flexible_period(start, end)
+
+
+_BULLET_LINE_RE = re.compile(r"^\s*(?:[-*\u2022\u25AA\u2023\u2043]|\d+[.)])\s+(.*)$")
+
+
+def split_role_description(desc: str) -> tuple[str, list[str]]:
+    """(project description, contributions) of a free-form role description.
+
+    Text above the first bullet, or the first of several paragraphs, is the brief project
+    description; the bullets or later paragraphs are the contributions. A single paragraph
+    has no such split and returns ("", []).
+    """
+    text = (desc or "").strip()
+    if not text:
+        return "", []
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if sum(1 for ln in lines if _BULLET_LINE_RE.match(ln)) >= 2:
+        lead: list[str] = []
+        items: list[str] = []
+        for ln in lines:
+            m = _BULLET_LINE_RE.match(ln)
+            if m:
+                items.append(m.group(1).strip())
+            elif items:
+                items[-1] = f"{items[-1]} {ln}"
+            else:
+                lead.append(ln)
+        return " ".join(lead), items
+    paragraphs = [" ".join(p.split()) for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if len(paragraphs) >= 2:
+        return paragraphs[0], paragraphs[1:]
+    return "", []
+
+
+def _contribution_key(text: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", (text or "").lower()))[:60]
+
+
+def _repeats_contributions(desc: str, contribs: list[str]) -> bool:
+    """True when a free-form description restates a contribution instead of describing the project."""
+    flat = " ".join(re.findall(r"[a-z0-9]+", (desc or "").lower()))
+    return any(len(key) >= 30 and key in flat for key in (_contribution_key(c) for c in contribs))
+
+
+def user_profile_to_openai_text(profile: Any) -> str:
+    """
+    Convert user profile to OpenAI-optimized resume-style text.
+
+    Args:
+        profile: User model instance, dict, or object with profile fields.
+                 Supports: name_first, name_middle, name_last, profile_title, profile_email,
+                 phone_country_code, phone_number, linkedin_url, github_url, profile_summary,
+                 technical_skills, work_experience, education, certificates, extra.
+
+    Returns:
+        Formatted text suitable for OpenAI Chat Completions context.
+    """
+    parts: list[str] = []
+
+    # Header: name and contact
+    name_parts = [
+        _s(profile, "name_first"),
+        _s(profile, "name_middle"),
+        _s(profile, "name_last"),
+    ]
+    full_name = " ".join(p for p in name_parts if p).strip()
+    if not full_name:
+        full_name = _s(profile, "name")
+
+    contact_parts: list[str] = []
+    title = _s(profile, "profile_title") or _s(profile, "title")
+    if title:
+        contact_parts.append(title)
+    email = _s(profile, "profile_email") or _s(profile, "email")
+    if email:
+        contact_parts.append(email)
+    phone_cc = _s(profile, "phone_country_code")
+    phone_num = _s(profile, "phone_number")
+    if phone_cc and phone_num:
+        contact_parts.append(f"{phone_cc} {phone_num}".strip())
+    elif phone_num:
+        contact_parts.append(phone_num)
+    links: list[str] = []
+    if _s(profile, "linkedin_url"):
+        links.append(f"LinkedIn: {_s(profile, 'linkedin_url')}")
+    if _s(profile, "github_url"):
+        links.append(f"GitHub: {_s(profile, 'github_url')}")
+    if links:
+        contact_parts.append(" | ".join(links))
+
+    if full_name:
+        parts.append(f"# {full_name}")
+    if contact_parts:
+        parts.append(" | ".join(contact_parts))
+    if parts:
+        parts.append("")  # blank line
+
+    # Profile summary
+    summary = _s(profile, "profile_summary")
+    if summary:
+        parts.append("## Summary")
+        parts.append(summary)
+        parts.append("")
+
+    # Technical skills
+    tech_skills = _list(profile, "technical_skills")
+    if tech_skills:
+        parts.append("## Technical Skills")
+        for block in tech_skills:
+            cat = (block.get("category") if isinstance(block, dict) else getattr(block, "category", "")) or ""
+            skills = (block.get("skills") if isinstance(block, dict) else getattr(block, "skills", "")) or ""
+            if cat or skills:
+                line = f"- **{cat}**: {skills}" if cat else f"- {skills}"
+                parts.append(line)
+        parts.append("")
+
+    # Work experience
+    work_exp = _list(profile, "work_experience")
+    if work_exp:
+        parts.append("## Work Experience")
+        for w in work_exp:
+            company = (w.get("company_name") if isinstance(w, dict) else getattr(w, "company_name", "")) or ""
+            job_title = (w.get("job_title") if isinstance(w, dict) else getattr(w, "job_title", "")) or ""
+            period = _format_period(
+                (w.get("period_start") if isinstance(w, dict) else getattr(w, "period_start", None)) or "",
+                (w.get("period_end") if isinstance(w, dict) else getattr(w, "period_end", None)) or "",
+            )
+            location = (w.get("location") if isinstance(w, dict) else getattr(w, "location", None)) or ""
+            job_type = (w.get("job_type") if isinstance(w, dict) else getattr(w, "job_type", None)) or ""
+            employment_type = (w.get("employment_type") if isinstance(w, dict) else getattr(w, "employment_type", None)) or ""
+            project_title = (w.get("project_title") if isinstance(w, dict) else getattr(w, "project_title", None)) or ""
+            project_intro = (w.get("project_intro") if isinstance(w, dict) else getattr(w, "project_intro", None)) or ""
+            used_skills = (w.get("used_skills") if isinstance(w, dict) else getattr(w, "used_skills", None)) or ""
+            contributions = (w.get("contributions") if isinstance(w, dict) else getattr(w, "contributions", None)) or []
+            desc = (w.get("description") if isinstance(w, dict) else getattr(w, "description", None)) or ""
+
+            sub_parts: list[str] = []
+            header = f"**{company}**"
+            if job_title:
+                header += f" | {job_title}"
+            if period:
+                header += f" | {period}"
+            sub_parts.append(header)
+            meta = [m for m in [location, job_type, employment_type] if m]
+            if meta:
+                sub_parts.append(", ".join(meta))
+            contribs = [
+                c.strip() for c in (contributions if isinstance(contributions, (list, tuple)) else [])
+                if isinstance(c, str) and c.strip()
+            ]
+            # The brief project description renders above the contributions, so it is labelled
+            # for the tailoring prompt; a description written next to contributions plays that part.
+            intro, leftover = str(project_intro).strip(), ""
+            if desc and contribs:
+                desc_intro, desc_contribs = split_role_description(desc)
+                if desc_contribs:
+                    # A bulleted description is contributions, not the project brief.
+                    known = {_contribution_key(c) for c in contribs}
+                    contribs += [c for c in desc_contribs if _contribution_key(c) not in known]
+                    intro = intro or desc_intro
+                elif not intro and not _repeats_contributions(desc, contribs):
+                    intro = desc
+            elif desc:
+                desc_intro, desc_contribs = split_role_description(desc)
+                if desc_contribs:
+                    intro, contribs = intro or desc_intro, desc_contribs
+                else:
+                    leftover = desc
+            if project_title:
+                sub_parts.append(f"Project: {project_title}")
+            if intro:
+                sub_parts.append(f"Project description: {' '.join(intro.split())}")
+            sub_parts.extend(f"- {c}" for c in contribs)
+            if used_skills:
+                sub_parts.append(f"Technologies: {used_skills}")
+            if leftover:
+                sub_parts.append(leftover)
+            parts.append("\n".join(sub_parts))
+            parts.append("")
+        parts.append("")
+
+    # Education
+    education = _list(profile, "education")
+    if education:
+        parts.append("## Education")
+        for e in education:
+            univ = (e.get("university_name") if isinstance(e, dict) else getattr(e, "university_name", "")) or ""
+            degree = (e.get("degree") if isinstance(e, dict) else getattr(e, "degree", "")) or ""
+            mark = (e.get("mark") if isinstance(e, dict) else getattr(e, "mark", None)) or ""
+            period = _format_period(
+                (e.get("period_start") if isinstance(e, dict) else getattr(e, "period_start", None)) or "",
+                (e.get("period_end") if isinstance(e, dict) else getattr(e, "period_end", None)) or "",
+            )
+            location = (e.get("location") if isinstance(e, dict) else getattr(e, "location", None)) or ""
+            desc = (e.get("description") if isinstance(e, dict) else getattr(e, "description", None)) or ""
+
+            sub_parts = [f"**{univ}** | {degree}"]
+            if mark:
+                sub_parts[0] += f" | {mark}"
+            if period:
+                sub_parts.append(period)
+            if location:
+                sub_parts.append(location)
+            if desc:
+                sub_parts.append(desc)
+            parts.append("\n".join(sub_parts))
+            parts.append("")
+        parts.append("")
+
+    # Certificates
+    certs = _list(profile, "certificates")
+    if certs:
+        parts.append("## Certificates")
+        for c in certs:
+            name = (c.get("name") if isinstance(c, dict) else getattr(c, "name", "")) or ""
+            if not name:
+                continue
+            issued = format_flexible_date(
+                (c.get("issued_at") if isinstance(c, dict) else getattr(c, "issued_at", None)) or ""
+            )
+            url = (c.get("url") if isinstance(c, dict) else getattr(c, "url", None)) or ""
+            line = f"- {name}"
+            if issued:
+                line += f" ({issued})"
+            if url:
+                line += f" - {url}"
+            parts.append(line)
+        parts.append("")
+
+    # Extra
+    extra = _list(profile, "extra")
+    if extra:
+        parts.append("## Additional Information")
+        for line in extra:
+            if isinstance(line, str) and line.strip():
+                parts.append(f"- {line.strip()}")
+        parts.append("")
+
+    return "\n".join(parts).strip()

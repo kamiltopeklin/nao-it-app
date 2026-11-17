@@ -1,0 +1,225 @@
+// File upload driver: <input type="file">.
+//
+// Greenhouse hides the real file input (.visually-hidden) inside a
+// <div role="group" aria-labelledby="upload-label-resume"> whose label text
+// ("Resume/CV", "Cover Letter") is the only thing that distinguishes resume from
+// cover letter - the input's own <label> just says "Attach". So we read the
+// enclosing group label first. The file bytes are injected via DataTransfer.
+(() => {
+  const AF = window.__AF;
+  if (!AF) return;
+  const { clean, textOfIds, labelForControl, markFilled } = AF.dom;
+
+  function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  function writeFile(el, fileData) {
+    try {
+      const bytes = base64ToBytes(fileData.base64);
+      const name = fileData.filename || "resume.pdf";
+      const mime =
+        fileData.mime ||
+        (/\.pdf$/i.test(name) ? "application/pdf" : "application/octet-stream");
+      const file = new File([bytes], name, { type: mime });
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      el.files = dt.files;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      try {
+        el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertFromPaste" }));
+      } catch {}
+      return !!(el.files && el.files.length);
+    } catch {
+      return false;
+    }
+  }
+
+  AF.registerDriver({
+    type: "file",
+    priority: 30,
+    match(el) {
+      if (el.tagName !== "INPUT" || (el.type || "").toLowerCase() !== "file") return null;
+      // Ashby shows a convenience "Autofill from resume" drop zone ABOVE the form
+      // whose file input parses the resume and overwrites fields. That's not an
+      // application field and fighting it causes races, so never claim it - we
+      // attach to the real Resume field (#_systemfield_resume) instead.
+      if (
+        el.closest &&
+        el.closest(".ashby-application-form-autofill-uploader, .ashby-application-form-autofill-input-root")
+      ) {
+        return null;
+      }
+      // SmartRecruiters ships THREE file inputs: the "Easy Apply" drop zone (its
+      // spl-dropzone host is data-test="apply-with-resume-container"), the avatar
+      // "Upload profile image" button, and the real Resume field
+      // (spl-dropzone[data-test="resume-upload"]). Claim only the resume one.
+      try {
+        const rootNode = el.getRootNode && el.getRootNode();
+        const dzHost = rootNode && rootNode.host; // spl-dropzone when el is in its shadow
+        const dz = dzHost && dzHost.getAttribute && dzHost.getAttribute("data-test");
+        if (dz === "apply-with-resume-container") return null;
+        const al = (el.getAttribute && el.getAttribute("aria-label")) || "";
+        if (/upload profile image|profile image/i.test(al)) return null;
+        if (el.closest && el.closest("oc-file-upload-button, oc-apply-with-resume")) return null;
+      } catch {}
+      // iCIMS: the resume input's own onchange appends &uploadResume=1 to the
+      // form action and calls form.submit(), so attaching a file NAVIGATES the
+      // page and the server re-renders the form from the parsed resume. It is
+      // uploaded FIRST by the resume prep (content/engine/icims.js), never as a
+      // normal file control mid-fill - that would discard everything written.
+      if (AF.icims && AF.icims.shouldSkipControl && AF.icims.shouldSkipControl(el)) return null;
+      // Lever: skip the LinkedIn AWLI widget row - not an application upload field.
+      if (el.closest && el.closest(".awli-application-row, .awli-button-container")) return null;
+      // Workable: skip photo upload; claim only data-ui="resume".
+      try {
+        const ui = el.getAttribute && el.getAttribute("data-ui");
+        if (ui === "avatar") return null;
+        if (el.closest && el.closest('[data-ui="autofill-button"]')) return null;
+      } catch {}
+      return el;
+    },
+    extract(root) {
+      const grp = root.closest && root.closest('[role="group"][aria-labelledby]');
+      let label = grp ? textOfIds(grp.getAttribute("aria-labelledby")) : "";
+      // SmartRecruiters' resume dropzone has no group label; name it "Resume" so
+      // the backend maps the candidate's resume file to it.
+      if (!label) {
+        try {
+          const rootNode = root.getRootNode && root.getRootNode();
+          const dz = rootNode && rootNode.host && rootNode.host.getAttribute && rootNode.host.getAttribute("data-test");
+          if (dz === "resume-upload") label = "Resume";
+        } catch {}
+      }
+      // Rippling wraps each hidden input in <label aria-labelledby="file-input-N
+      // field-M-label">: the first id is a screen-reader "Total 0 file selected"
+      // counter, the second the field title ("Résumé" / "Cover letter"). The
+      // label's own text is just "Drop or select (.doc / .docx / .pdf)" on both.
+      if (!label) {
+        const wrap = root.closest && root.closest("label[aria-labelledby]");
+        if (wrap) {
+          label = clean(
+            textOfIds(wrap.getAttribute("aria-labelledby")).replace(/total\s+\d+\s+files?\s+selected/gi, "")
+          );
+        }
+      }
+      // Workable: once a resume is on file (a restored draft) the dropzone's
+      // generic label reads "Replace file", which would not map to the resume.
+      if (!label && root.getAttribute && root.getAttribute("data-ui") === "resume") label = "Resume";
+      if (!label) label = labelForControl(root);
+      // Pinpoint structured attachments: question title distinguishes Resume vs Cover Letter.
+      if (!label && AF.pinpoint && AF.pinpoint.questionTitleFor) {
+        label = AF.pinpoint.questionTitleFor(root);
+      }
+      // Lever: Resume/CV label lives in .application-label on li.application-question.resume.
+      if (!label && AF.lever && AF.lever.questionLabelFor) {
+        label = AF.lever.questionLabelFor(root);
+      }
+      // Breezy: hidden #main-attachment resume upload.
+      if (!label && (root.id === "main-attachment" || root.name === "cResume")) label = "Resume";
+      if (!label && (root.name === "resume" || root.id === "resume-upload-input")) label = "Resume/CV";
+      // Manatal: placeholder="Resume" / .form-group label "Resume: *".
+      if (!label && AF.manatal && AF.manatal.questionTitleFor) {
+        label = AF.manatal.questionTitleFor(root);
+      }
+      // JobDiva: resume file inside .jd-dropzone / .jd-form-layout.
+      if (!label && AF.jobdiva && AF.jobdiva.questionTitleFor) {
+        label = AF.jobdiva.questionTitleFor(root);
+      }
+      // Grid Dynamics / CF7 vacancy-form-file: option label is just "File"; the
+      // section heading ("Resume*" / "Additional files") or name/id is the real role.
+      try {
+        const testId = (root.getAttribute && root.getAttribute("data-testid")) || "";
+        const nameId = `${root.name || ""} ${root.id || ""} ${testId}`.toLowerCase();
+        if (/additional_files|cover.?letter/.test(nameId)) {
+          label = "Cover Letter";
+        } else if (/(^|\s)resume(\s|$)/.test(nameId) || nameId.includes("resume-input")) {
+          label = label && !/^file$/i.test(label) ? label : "Resume";
+        } else {
+          const field =
+            (root.closest &&
+              root.closest(
+                ".apply-to-vacancy-form__field, .additional-files, .vacancy-form-file"
+              )) ||
+            null;
+          const sectionLab = field
+            ? clean(
+                (
+                  field.querySelector(
+                    ".apply-to-vacancy-form__label--big, .apply-to-vacancy-form__label"
+                  ) || {}
+                ).innerText || ""
+              )
+            : "";
+          if (/additional\s*files|cover\s*letter/i.test(sectionLab)) label = "Cover Letter";
+          else if (/resume/i.test(sectionLab) && (!label || /^file$/i.test(label))) label = sectionLab;
+        }
+      } catch {}
+      return {
+        kind: "file",
+        label: label || "File",
+        required:
+          !!root.required ||
+          (root.getAttribute && root.getAttribute("aria-required") === "true") ||
+          !!(AF.manatal && AF.manatal.isRequiredControl && AF.manatal.isRequiredControl(root)) ||
+          !!(AF.jobdiva && AF.jobdiva.isRequiredControl && AF.jobdiva.isRequiredControl(root)),
+        is_file: true,
+        // Cap the accept hint: SmartRecruiters' dropzone lists ~60 extensions
+        // (600+ chars), which overflows the backend's accept length cap and 422s
+        // the whole autofill request. The label already identifies the file.
+        accept: String(root.accept || "").slice(0, 280),
+      };
+    },
+    isFilled(root) {
+      return !!(root.files && root.files.length);
+    },
+    async write(root, answer, env) {
+      const fd = env && env.file;
+      if (!fd) return false;
+      // Grid Dynamics: "Add cover letter" must open before change handlers update UI.
+      try {
+        const widget = root.closest && root.closest(".vacancy-form-file");
+        if (widget) {
+          const btn = widget.querySelector(
+            ".vacancy-form-file__button:not(.vacancy-form-file__button--hidden)"
+          );
+          const popup = widget.querySelector(".vacancy-form-file__popup");
+          if (btn && popup && !popup.classList.contains("vacancy-form-file__popup--open")) {
+            try {
+              btn.click();
+            } catch {}
+          }
+        }
+      } catch {}
+      const ok = writeFile(root, fd);
+      if (ok) {
+        markFilled(root);
+        syncVacancyFormFileUI(root);
+      }
+      return ok;
+    },
+  });
+
+  // Custom career pages (Grid Dynamics vacancy-form-file): after DataTransfer
+  // attach, mirror their change handler so the filename chip appears even if
+  // their listener only arms after a user click on "File".
+  function syncVacancyFormFileUI(el) {
+    try {
+      const widget = el.closest && el.closest(".vacancy-form-file");
+      if (!widget || !el.files || !el.files.length) return;
+      const name = el.files[0].name || "";
+      const fileRow = widget.querySelector(".vacancy-form-file__file");
+      const filename = widget.querySelector(".vacancy-form-file__filename");
+      const btn = widget.querySelector(".vacancy-form-file__button");
+      const popup = widget.querySelector(".vacancy-form-file__popup");
+      if (filename) filename.textContent = name;
+      if (fileRow) fileRow.classList.add("vacancy-form-file__file--has-file");
+      if (btn) btn.classList.add("vacancy-form-file__button--hidden");
+      if (popup) popup.classList.remove("vacancy-form-file__popup--open");
+    } catch {}
+  }
+})();

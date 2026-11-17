@@ -1,0 +1,104 @@
+# Redis + Postgres for the VPS (and local Docker). Bind to loopback only —
+# nginx (or Vite) is the public entrypoint; do not expose DB/Redis on the WAN.
+#
+#   docker compose --profile docker-db up -d
+#
+# POSTGRES_* in .env must match DATABASE_URL.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: showerv3-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - "2gb"
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - "60"
+      - "1000"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: showerv3-postgres
+    profiles:
+      - docker-db
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-job_scraper}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # CPX51-class host (16 vCPU / 32GB): raise connections + memory for shared
+    # API+worker load. ALTER SYSTEM on a live volume also works; these flags
+    # apply cleanly on fresh volume init / compose recreate.
+    command:
+      - postgres
+      - -c
+      - max_connections=300
+      - -c
+      - shared_buffers=6GB
+      - -c
+      - effective_cache_size=20GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=1GB
+      - -c
+      - wal_buffers=64MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - max_worker_processes=16
+      - -c
+      - max_parallel_workers=12
+      - -c
+      - max_parallel_workers_per_gather=4
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # Optional UI for inspecting queues / keys (http://127.0.0.1:5540)
+  redis-insight:
+    image: redis/redisinsight:latest
+    container_name: showerv3-redis-insight
+    ports:
+      - "127.0.0.1:5540:5540"
+    volumes:
+      - redis_insight_data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - tools
+
+volumes:
+  redis_data:
+  postgres_data:
+  redis_insight_data:

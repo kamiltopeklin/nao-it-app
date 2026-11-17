@@ -1,0 +1,1320 @@
+from sqlalchemy import Column, String, Text, Date, DateTime, Float, Integer, Enum as SQLEnum, Index, JSON, Boolean, ForeignKey, LargeBinary, UniqueConstraint
+from sqlalchemy.orm import declarative_base, deferred, validates
+from sqlalchemy.sql import func
+from app.models.schemas import ExtractionMethod, ExtractionStatus
+import uuid
+
+Base = declarative_base()
+
+
+def _location_without_work_mode(value: str | None) -> str | None:
+    from app.services.job_location_parse import strip_work_mode_from_location
+
+    cleaned = strip_work_mode_from_location(value)
+    return cleaned[:500] if cleaned else None
+
+
+class User(Base):
+    """User account with single profile (one profile per account)."""
+    __tablename__ = "users"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    name = Column(String(100), nullable=True)  # Display name (header)
+    password_hash = Column(String(255), nullable=False)
+    is_active = Column(Boolean, default=True, index=True)
+    # Platform admin. Existing users are bootstrapped true via migration 048;
+    # new signups default to false.
+    is_admin = Column(Boolean, default=False, nullable=False, server_default="false", index=True)
+    # Tokens issued before this instant are rejected (admin password reset).
+    sessions_valid_after = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    # Profile fields (one profile per user)
+    name_first = Column(String(100), nullable=True)
+    name_middle = Column(String(100), nullable=True)
+    name_last = Column(String(100), nullable=True)
+    profile_title = Column(String(200), nullable=True)
+    profile_email = Column(String(255), nullable=True)
+    phone_country_code = Column(String(10), nullable=True)
+    phone_number = Column(String(30), nullable=True)
+    linkedin_url = Column(String(500), nullable=True)
+    github_url = Column(String(500), nullable=True)
+    # Heavy profile payloads, deferred so auth/admin list queries stay light.
+    # Accessing any of these columns loads that column on demand.
+    profile_summary = deferred(Column(Text, nullable=True))
+    # Square headshot as a data:image/... URL. Independent of any resume photo.
+    profile_photo = deferred(Column(Text, nullable=True))
+    technical_skills = deferred(Column(JSON, default=list))
+    work_experience = deferred(Column(JSON, default=list))
+    education = deferred(Column(JSON, default=list))
+    certificates = deferred(Column(JSON, default=list))
+    extra = deferred(Column(JSON, default=list))
+
+    # Voluntary EEO / demographic answers used to auto-fill application forms
+    # (Workday etc.). Object of: gender, race, sexual_orientation,
+    # hispanic_latino, veteran_status, disability_status, work_authorized,
+    # needs_sponsorship. Null/blank fields fall back to the engine's defaults.
+    eeo_preferences = deferred(Column(JSON, default=dict))
+
+    # Legal / home address for application autofill (Workday requires
+    # Address/City/State/Postal), plus optional local_preferences (list of
+    # preferred job locales). Object of: line1, line2, city, state,
+    # postal_code, country, local_preferences.
+    address = deferred(Column(JSON, default=dict))
+
+    # Cached OpenAI-ready text (updated on profile save)
+    profile_openai_cache = deferred(Column(Text, nullable=True))
+
+    # Deduplication recycle window: jobs older than this many days are treated
+    # as "fresh" at their company - a new posting won't be auto-excluded even
+    # if the user already applied to an older posting there. Default 60 days.
+    dedup_recycle_days = Column(Integer, default=60, nullable=False, server_default="60")
+    dedup_recycle_mode = Column(String(20), default="default", nullable=False, server_default="default")
+
+    # Optional dedup rules (platform default → user custom), same pattern as recycle days.
+    dedup_applied_company_mode = Column(String(20), default="default", nullable=False, server_default="default")
+    dedup_applied_company_enabled = Column(Boolean, default=False, nullable=False, server_default="false")
+    dedup_score_comparison_mode = Column(String(20), default="default", nullable=False, server_default="default")
+    dedup_score_comparison_enabled = Column(Boolean, default=False, nullable=False, server_default="false")
+
+    # Auto-prepare: when platform JD is ready, enqueue personal match (and optionally full tailor).
+    auto_prepare_match = Column(Boolean, default=True, nullable=False, server_default="true")
+    auto_prepare_full = Column(Boolean, default=False, nullable=False, server_default="false")
+
+    # Manual URL/paste submit depth: extract | match | full (default full).
+    manual_submit_pipeline = Column(String(20), default="full", nullable=False, server_default="full")
+
+    # Résumé used for applications: "tailored" (per-job rewrite after scoring) or
+    # "original" (score only; extension uploads and fills from the original résumé).
+    application_resume_source = Column(String(20), default="tailored", nullable=False, server_default="tailored")
+    # How tailoring writes experience: "evidence" (only what the profile shows; product default)
+    # or "job_first" (rewritten around the posting's stack, keeping employers, titles, dates and domains).
+    resume_tailoring_strategy = Column(String(20), default="job_first", nullable=False, server_default="job_first")
+
+    # LLM second opinion on the free vector score: "off", "rescore" (only when the
+    # user re-runs a scored job) or "auto" (also new jobs the free engine scores at
+    # or above match_quality_check_min_score).
+    match_quality_check = Column(String(20), default="rescore", nullable=False, server_default="rescore")
+    match_quality_check_min_score = Column(Integer, default=70, nullable=False, server_default="70")
+
+    # OpenAI: "default" uses server OPENAI_API_KEY; "custom" uses encrypted user key.
+    openai_key_mode = Column(String(20), default="default", nullable=False, server_default="default")
+    openai_api_key_encrypted = deferred(Column(Text, nullable=True))
+
+    # Active LLM provider powering this user's AI work ("openai" | "anthropic" | "gemini").
+    llm_provider = Column(String(20), default="openai", nullable=False, server_default="openai")
+    # Preferred model id for the OpenAI-compatible gateway (many models per key).
+    # Null = fall back to admin job binding model, then system openai_model.
+    llm_model = Column(String(200), nullable=True)
+
+    # Anthropic / Gemini bring-your-own keys (mode "default" uses the server key;
+    # "custom" uses the encrypted user-provided key). Mirrors the OpenAI pattern.
+    anthropic_key_mode = Column(String(20), default="default", nullable=False, server_default="default")
+    anthropic_api_key_encrypted = deferred(Column(Text, nullable=True))
+    gemini_key_mode = Column(String(20), default="default", nullable=False, server_default="default")
+    gemini_api_key_encrypted = deferred(Column(Text, nullable=True))
+
+    # Minimum match score: jobs below threshold are hidden (below_min_score exclusion).
+    min_match_score_mode = Column(String(20), default="default", nullable=False, server_default="default")
+    min_match_score = Column(Integer, default=0, nullable=False, server_default="0")
+
+    # Resume tailoring (Phase B): default uses built-in instructions; custom stores editable instructions.
+    resume_tailoring_prompt_mode = Column(String(20), default="default", nullable=False, server_default="default")
+    resume_tailoring_prompt_custom = deferred(Column(Text, nullable=True))
+
+    # Cover letter generation (Phase B, Task 2): separate editable instructions from resume tailoring.
+    cover_letter_prompt_mode = Column(String(20), default="default", nullable=False, server_default="default")
+    cover_letter_prompt_custom = deferred(Column(Text, nullable=True))
+
+    # Free-text job preferences used by the match analysis engine (Phase A).
+    job_match_preferences = deferred(Column(Text, nullable=True))
+
+    # Preferred job countries (ISO 3166-1 alpha-2 codes). Empty list = no
+    # location filtering (worldwide). Source: 'unset' | 'auto' (resume parse
+    # detection) | 'manual' (preferences page). Auto never overwrites manual.
+    country_preferences = Column(JSON, default=list, nullable=False, server_default="[]")
+    country_preferences_source = Column(
+        String(20), default="unset", nullable=False, server_default="unset"
+    )
+
+    # Preferred work modes (remote / hybrid / onsite). Empty = any mode.
+    # Non-empty allow-list hides known outside modes from the jobs board.
+    work_mode_preferences = Column(JSON, default=list, nullable=False, server_default="[]")
+
+    # Starting share for jobs this user adds: private | team | all | ask.
+    # ask keeps the add private and prompts after the add.
+    job_share_default = Column(String(16), default="private", nullable=False, server_default="private")
+    # Cached sum of credit_ledger.delta; every change writes a ledger row in the same transaction.
+    credit_balance = Column(Integer, default=0, nullable=False, server_default="0")
+    resume_filename_mode = Column(String(20), default="pattern", nullable=False, server_default="pattern")
+    resume_filename_value = Column(
+        String(200),
+        default="{firstname}_{lastname}_{kind}",
+        nullable=False,
+        server_default="{firstname}_{lastname}_{kind}",
+    )
+
+    # Visual resume builder design (theme/typography/colors/layout). Every résumé is
+    # compiled from this design; the working template + blueprint are derived from it.
+    # These columns MIRROR the currently-active resume in the library (see
+    # active_resume_id / ResumeDocument) so the extension, downloads and job-tailoring
+    # keep reading one "current" working template.
+    resume_template_status = Column(String(30), default="missing", nullable=False, server_default="missing")
+    resume_template_working_path = deferred(Column(Text, nullable=True))
+    resume_template_blueprint = deferred(Column(JSON, nullable=True))
+    resume_template_error = Column(Text, nullable=True)
+    resume_template_design = deferred(Column(JSON, nullable=True))
+
+    # Multi-resume library: the resume currently loaded/edited in the builder. Points at
+    # a resume_documents row; that row's design is mirrored into the columns above.
+    active_resume_id = Column(
+        String(36),
+        ForeignKey("resume_documents.id", ondelete="SET NULL", name="fk_users_active_resume_id", use_alter=True),
+        nullable=True,
+    )
+
+    # Per-user cover letter template, compiled from the resume builder design.
+    cover_letter_template_status = Column(String(30), default="missing", nullable=False, server_default="missing")
+    cover_letter_template_working_path = deferred(Column(Text, nullable=True))
+    cover_letter_template_error = Column(Text, nullable=True)
+
+
+class ResumeCustomTheme(Base):
+    """A user-saved resume style theme (typography/colors/layout/sections snapshot)."""
+
+    __tablename__ = "resume_custom_themes"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name = Column(String(200), nullable=False)
+    description = Column(String(500), nullable=False, default="Custom theme", server_default="Custom theme")
+    accent_swatch = Column(String(32), nullable=False, default="#2563eb", server_default="#2563eb")
+    design = Column(JSON, nullable=False)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+
+class ResumeThemeLove(Base):
+    """Per-user loved theme ids (built-in catalog ids or custom theme ids)."""
+
+    __tablename__ = "resume_theme_loves"
+
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+        nullable=False,
+    )
+    theme_id = Column(String(64), primary_key=True, nullable=False)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (Index("ix_resume_theme_loves_user_id", "user_id"),)
+
+
+class ResumeDocument(Base):
+    """A saved resume in the user's library (multi-resume support).
+
+    Each row is one self-contained resume: a full ResumeDesign JSON (theme + content
+    override) plus metadata. The user's active resume is mirrored into the
+    users.resume_template_* columns so all existing consumers (extension, download,
+    job-tailoring) keep working against a single "current" working template."""
+    __tablename__ = "resume_documents"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name = Column(String(200), nullable=False, default="Untitled resume")
+    # "draft" | "completed" - user-controlled via a "Mark as complete" toggle.
+    status = Column(String(20), nullable=False, default="draft", server_default="draft")
+    # "manual" | "tailored" - how the resume was created.
+    source = Column(String(20), nullable=False, default="manual", server_default="manual")
+    # Full design JSON, deferred; search/metadata lists should not load it.
+    design = deferred(Column(JSON, nullable=True))
+    # For tailored resumes: the role this was tailored to (used for naming/labels).
+    job_title = Column(String(300), nullable=True)
+    company = Column(String(300), nullable=True)
+    # Cover letter body generated alongside a tailored resume (plain text, blank-line paragraphs).
+    cover_letter = deferred(Column(Text, nullable=True))
+    # The pasted posting a resume was tailored to; the hash dedupes reruns of the same posting.
+    job_description = deferred(Column(Text, nullable=True))
+    job_description_hash = Column(String(64), nullable=True)
+    match_score = Column(Integer, nullable=True)
+    # "assistant" | "documents" | "builder" | "job" - where the tailoring was requested.
+    origin = Column(String(20), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_resume_documents_user_jd_hash", "user_id", "job_description_hash"),
+    )
+
+
+class UserOriginalResume(Base):
+    """The résumé file the user imported, byte for byte, one per user.
+
+    "My original resume" mode uploads this file to applications unchanged and
+    fills answers from its text, instead of re-rendering the profile through a
+    Resume Studio theme."""
+    __tablename__ = "user_original_resumes"
+
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+        nullable=False,
+    )
+    filename = Column(String(255), nullable=False)
+    kind = Column(String(10), nullable=False)  # pdf | docx
+    byte_size = Column(Integer, nullable=False, default=0)
+    file_bytes = deferred(Column(LargeBinary, nullable=False))
+    # PDF rendering of a DOCX upload, for forms that only take PDFs. Built lazily.
+    pdf_bytes = deferred(Column(LargeBinary, nullable=True))
+    text = deferred(Column(Text, nullable=True))
+    uploaded_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+
+class ProfileSourceDocument(Base):
+    """Per-user project source documents for resume tailoring (C: structured on upload)."""
+    __tablename__ = "profile_source_documents"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    filename = Column(String(500), nullable=False)
+    source_kind = Column(String(20), nullable=False)  # pdf | docx | markdown
+    company_name = Column(String(200), nullable=True)
+    # Large blobs, deferred for metadata list endpoints.
+    extracted_text = deferred(Column(Text, nullable=True))
+    structured_data = deferred(Column(JSON, nullable=True))
+    char_count = Column(Integer, default=0, nullable=False, server_default="0")
+    project_count = Column(Integer, default=0, nullable=False, server_default="0")
+    parse_status = Column(String(20), default="pending", nullable=False, server_default="pending")
+    parse_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_psd_user_parse_status", "user_id", "parse_status"),
+    )
+
+
+class JobExtraction(Base):
+    __tablename__ = "job_extractions"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    source_url = Column(Text, nullable=False)
+    normalized_url = Column(String(2048), nullable=False, index=True)
+    domain = Column(String(255), nullable=False)
+    status = Column(SQLEnum(ExtractionStatus), default=ExtractionStatus.PENDING, nullable=False)
+    extraction_method = Column(SQLEnum(ExtractionMethod), nullable=True)
+    title = Column(String(500), nullable=True)
+    company = Column(String(500), nullable=True)
+    location = Column(String(500), nullable=True)
+    employment_type = Column(String(500), nullable=True)
+    salary_range = Column(String(200), nullable=True)
+    description = Column(Text, nullable=True)
+    responsibilities = Column(JSON, default=list)
+    requirements = Column(JSON, default=list)
+    benefits = Column(JSON, default=list)
+    remote_policy = Column(String(500), nullable=True)
+    work_mode = Column(String(20), nullable=True)
+    experience_level = Column(String(500), nullable=True)
+    industry = Column(String(200), nullable=True)
+    raw_metadata = Column(JSON, default=dict)
+    is_job_posting = Column(Boolean, nullable=True)
+    # Large scrape text, only needed for Phase A/B job_text fallback.
+    raw_plain_text = deferred(Column(Text, nullable=True))
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_job_extractions_status", "status"),
+        Index("ix_job_extractions_created_at", "created_at"),
+        Index("ix_job_extractions_domain_status", "domain", "status"),
+    )
+
+    @validates("location")
+    def _validate_location(self, _key, value):
+        # Work mode has its own column; Location holds only the place.
+        return _location_without_work_mode(value)
+
+
+class Job(Base):
+    """Unified job table - every submitted/scraped job lives here exactly once."""
+    __tablename__ = "jobs"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    source_url = Column(Text, nullable=False)
+    normalized_url = Column(String(2048), nullable=False, index=True)
+    domain = Column(String(255), nullable=False, index=True)
+    title = Column(String(500), nullable=True)
+    company = Column(String(500), nullable=False)
+    location = Column(String(500), nullable=True)
+    work_mode = Column(String(20), nullable=True)
+    # Large JD body, deferred so dashboard/list queries stay light.
+    description = deferred(Column(Text, nullable=True))
+    posted_date = Column(DateTime, nullable=True)
+    experience_level = Column(String(100), nullable=True)
+    industry = Column(String(200), nullable=True)
+    raw_metadata = Column(JSON, default=dict)
+    extraction_id = Column(String(36), nullable=True, index=True)
+    scraped_at = Column(DateTime, nullable=True)
+    sheet_posted_at = Column(DateTime, nullable=True)
+    pumble_posted_at = Column(DateTime, nullable=True)
+    status = Column(String(30), default="active", nullable=False, index=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_jobs_company", "company"),
+        Index("ix_jobs_domain_company", "domain", "company"),
+        Index("ix_jobs_created_at", "created_at"),
+        Index("ix_jobs_work_mode", "work_mode"),
+    )
+
+    @validates("location")
+    def _validate_location(self, _key, value):
+        from app.services.job_location_parse import split_work_mode_from_location
+
+        cleaned, mode = split_work_mode_from_location(value)
+        if mode:
+            # A board label such as "Remote" may be the only mode signal; keep it
+            # as a fallback that later classification can still overwrite.
+            self._location_work_mode = mode
+            if not self.work_mode:
+                self.work_mode = mode
+        return cleaned[:500] if cleaned else None
+
+    @validates("work_mode")
+    def _validate_work_mode(self, _key, value):
+        return value or getattr(self, "_location_work_mode", None)
+
+
+class UserJobStatus(Base):
+    """Per-user job status - tracks whether a job is active, duplicated, or
+    hidden for a specific user.  Replaces the old user_job_exclusions,
+    user_dismissed_duplicates, and per-user aspects of invalid_jobs.
+    """
+    __tablename__ = "user_job_status"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    job_id = Column(
+        String(36),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status = Column(String(30), nullable=False)
+    duplicated_because_id = Column(
+        String(36),
+        ForeignKey("jobs.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    exclusion_type = Column(String(50), nullable=True)
+    reason = Column(Text, nullable=True)
+    match_score_at_decision = Column(Float, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "job_id", name="uq_user_job_status"),
+        Index("ix_ujs_job_id", "job_id"),
+        Index("ix_ujs_user_status", "user_id", "status"),
+    )
+
+
+class JobAddBatch(Base):
+    """One add session: a user pasted or uploaded a set of jobs together."""
+    __tablename__ = "job_add_batches"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source = Column(String(32), nullable=False, server_default="manual")
+    job_count = Column(Integer, nullable=False, server_default="0")
+    # private | team | all | users
+    share_scope = Column(String(16), nullable=False, server_default="private")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_job_add_batches_user_created", "user_id", "created_at"),
+    )
+
+
+class JobAddBatchJob(Base):
+    """Jobs that belong to one add session."""
+    __tablename__ = "job_add_batch_jobs"
+
+    batch_id = Column(
+        String(36),
+        ForeignKey("job_add_batches.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    job_id = Column(
+        String(36),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    __table_args__ = (
+        Index("ix_job_add_batch_jobs_job_id", "job_id"),
+    )
+
+
+class JobAddBatchShareUser(Base):
+    """Explicit recipients when a batch is shared with specific people."""
+    __tablename__ = "job_add_batch_share_users"
+
+    batch_id = Column(
+        String(36),
+        ForeignKey("job_add_batches.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+
+class JobMatchResult(Base):
+    """Cached AI job-profile match analysis result."""
+    __tablename__ = "job_match_results"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    job_id = Column(String(36), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    overall_score = Column(Integer, nullable=False)
+    dimension_scores = Column(JSON, nullable=False)
+    summary = Column(Text, nullable=True)
+    strengths = Column(JSON, default=list, nullable=False)
+    gaps = Column(JSON, default=list, nullable=False)
+    recommendation = Column(String(50), nullable=True)
+    # Provenance. Without these a stored score cannot be re-derived, and a
+    # re-score that disagrees is ambiguous between "the scorer changed" and
+    # "the encodings changed underneath it".
+    match_engine = Column(String(20), nullable=True)
+    scorer_version = Column(String(50), nullable=True)
+    model_version = Column(String(200), nullable=True)
+    # sha256 over every input the scorer read; see vector_match_service.
+    inputs_fingerprint = Column(String(64), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, nullable=True, onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("job_id", "user_id", name="uq_job_match_job_user"),
+    )
+
+
+class JobMatchInProgress(Base):
+    """Tracks in-progress AI job match analysis for real-time UI status."""
+    __tablename__ = "job_match_in_progress"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    job_id = Column(String(36), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("job_id", "user_id", name="uq_job_match_progress_job_user"),
+    )
+
+
+class JobEncoding(Base):
+    """Once-per-job vector encoding + extracted signals for non-LLM matching.
+
+    Vectors are float32 arrays stored as raw bytes (dimension defined by
+    ``model_version``); cosine math runs in Python/numpy, no pgvector
+    extension required on the database server.
+    """
+    __tablename__ = "job_encodings"
+
+    job_id = Column(
+        String(36), ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    model_version = Column(String(200), nullable=False)
+    # Embedding of the job title (or best title guess).
+    title_vec = deferred(Column(LargeBinary, nullable=True))
+    # Embedding of the substantive JD body (description + requirements).
+    content_vec = deferred(Column(LargeBinary, nullable=True))
+    # Embedding of company / industry / domain phrase (independent of JD body).
+    industry_vec = deferred(Column(LargeBinary, nullable=True))
+    # One float16 row per substantive JD line (requirement-level similarity).
+    chunk_vecs = deferred(Column(LargeBinary, nullable=True))
+    # Float16 rows for the posting lines in ``req_lines``, same order.
+    req_vecs = deferred(Column(LargeBinary, nullable=True))
+    # [{"t": line, "m": P(hard requirement), "n": P(nice to have)}, ...]
+    req_lines = deferred(Column(JSON, nullable=True))
+    # Compact posting digest read by the cross-encoder.
+    ce_text = deferred(Column(Text, nullable=True))
+    # {"skill": "required" | "preferred" | "mentioned", ...}
+    skills = Column(JSON, default=dict, nullable=False)
+    years_required = Column(Integer, nullable=True)
+    degree_required = Column(Boolean, nullable=True)
+    requires_security_clearance = Column(Boolean, default=False, nullable=False)
+    # {"family", "specialty", "level", "posting_issue"} from role_taxonomy / posting_validity.
+    signals = Column(JSON, nullable=True)
+    encoder_version = Column(String(40), nullable=True)
+    encoded_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+class UserEncoding(Base):
+    """Once-per-profile vector encoding, refreshed when the profile changes."""
+    __tablename__ = "user_encodings"
+
+    user_id = Column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    model_version = Column(String(200), nullable=False)
+    # Embedding of the full experience narrative.
+    experience_vec = deferred(Column(LargeBinary, nullable=True))
+    # Embedding of job preferences + custom guidance (null when unset).
+    prefs_vec = deferred(Column(LargeBinary, nullable=True))
+    # Embedding of industries / companies from work history (domain fit).
+    domain_vec = deferred(Column(LargeBinary, nullable=True))
+    # One float16 row per profile achievement line.
+    chunk_vecs = deferred(Column(LargeBinary, nullable=True))
+    # [{"title": str, "vec": base64-float32}, ...] recent titles, newest first.
+    title_vecs = Column(JSON, default=list, nullable=False)
+    # {"skill": recency_weight 0..1, ...}
+    skills = Column(JSON, default=dict, nullable=False)
+    years_experience = Column(Float, nullable=True)
+    has_degree = Column(Boolean, nullable=True)
+    # {"families", "specialties", "level", "level_from_years", "chunks"}.
+    signals = Column(JSON, nullable=True)
+    # Text of each ``chunk_vecs`` row, for requirement evidence in explanations.
+    chunk_texts = deferred(Column(JSON, nullable=True))
+    # Compact profile digest read by the cross-encoder.
+    ce_text = deferred(Column(Text, nullable=True))
+    encoder_version = Column(String(40), nullable=True)
+    # Hash of the encoded inputs; unchanged profiles are never re-encoded.
+    profile_hash = Column(String(64), nullable=True)
+    encoded_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+class UserJobSource(Base):
+    """A job board (Greenhouse/Lever/Ashby/Workable) a user registered.
+
+    Synced periodically: new postings on the board are pulled into the user's
+    pipeline via the normal submit/extract flow.
+    """
+    __tablename__ = "user_job_sources"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    url = Column(Text, nullable=False)
+    name = Column(String(200), nullable=False)
+    ats_type = Column(String(30), nullable=False)  # greenhouse | lever | ashby | workable
+    board_token = Column(String(200), nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False, server_default="true")
+    last_synced_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    # Postings seen on the board during the last sync.
+    last_listing_count = Column(Integer, nullable=True)
+    # New jobs created for this user during the last sync.
+    last_new_jobs = Column(Integer, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "ats_type", "board_token", name="uq_user_job_source_board"),
+    )
+
+
+class UserJobSiteConnection(Base):
+    """A pluginable job-site a user connected (API key, session cookies, or enable-only)."""
+
+    __tablename__ = "user_job_site_connections"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    plugin_slug = Column(String(40), nullable=False)
+    credentials_encrypted = Column(Text, nullable=True)
+    enabled = Column(Boolean, default=True, nullable=False, server_default="true")
+    last_synced_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    last_listing_count = Column(Integer, nullable=True)
+    last_new_jobs = Column(Integer, nullable=True)
+    # connected | needs_reauth | rate_limited | quota_exhausted | error
+    status = Column(String(20), nullable=False, default="connected", server_default="connected")
+    consecutive_failures = Column(Integer, nullable=False, default=0, server_default="0")
+    # None means "due now" while connected, "stopped" in any other status.
+    next_sync_at = Column(DateTime, nullable=True)
+    last_success_at = Column(DateTime, nullable=True)
+    # Lifetime fetches with the stored key, for boards with a lifetime cap.
+    request_count = Column(Integer, nullable=False, default=0, server_default="0")
+    # queued | fetching while a sync runs; None when idle. Analysis progress is
+    # derived from last_sync_jobs, so it needs no phase of its own.
+    sync_phase = Column(String(20), nullable=True)
+    sync_started_at = Column(DateTime, nullable=True)
+    # {"job_ids": [...], "analyze": bool}: what the last successful sync added
+    # and whether the user's pipeline scores those jobs.
+    last_sync_jobs = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "plugin_slug", name="uq_user_job_site_plugin"),
+    )
+
+
+class MatchEngineComparison(Base):
+    """Shadow-mode record: LLM score vs vector score for the same user x job."""
+    __tablename__ = "match_engine_comparisons"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    job_id = Column(String(36), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    llm_overall = Column(Integer, nullable=False)
+    vector_overall = Column(Integer, nullable=False)
+    llm_dimensions = Column(JSON, default=dict, nullable=False)
+    vector_dimensions = Column(JSON, default=dict, nullable=False)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_match_engine_comparisons_created_at", "created_at"),
+    )
+
+
+class SystemLogEvent(Base):
+    """Persisted structured log for the admin logs dashboard.
+
+    Fed by the structlog sink, HTTP req/res lifecycle, worker tasks, and
+    process events share one table keyed by request_id for timelines.
+    """
+    __tablename__ = "system_log_events"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    created_at = Column(DateTime, server_default=func.now(), nullable=False, index=True)
+    level = Column(String(20), nullable=False)
+    event = Column(String(200), nullable=False)
+    logger_name = Column(String(200), nullable=True)
+    # http | worker | process | system
+    category = Column(String(40), nullable=False, default="process", server_default="process", index=True)
+    # api | extraction | analysis | tailoring | save | resume | autopost | scraper | encoding
+    service = Column(String(40), nullable=False, default="api", server_default="api")
+    request_id = Column(String(64), nullable=True, index=True)
+    user_id = Column(String(36), nullable=True)
+    job_id = Column(String(36), nullable=True)
+    extraction_id = Column(String(36), nullable=True)
+    worker_job_type = Column(String(80), nullable=True)
+    method = Column(String(16), nullable=True)
+    path = Column(String(500), nullable=True, index=True)
+    status_code = Column(Integer, nullable=True)
+    duration_ms = Column(Float, nullable=True)
+    client_ip = Column(String(64), nullable=True)
+    message = Column(Text, nullable=True)
+    payload = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("ix_system_log_events_level_created", "level", "created_at"),
+    )
+
+
+class LlmUsageEvent(Base):
+    """One completed LLM call: who it was for, what feature ran it, tokens and cost.
+
+    Kept apart from system_log_events because logs are purged after a couple
+    of weeks while cost reporting needs months. ``run_id`` is the request id
+    shared by every call of one HTTP request or worker run, so a tailoring run
+    (resume + cover letter calls) counts once.
+    """
+    __tablename__ = "llm_usage_events"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    # No FKs: spend history must outlive user and job deletion, and a buffered
+    # batch must never fail because one referenced row disappeared.
+    user_id = Column(String(36), nullable=True)
+    job_id = Column(String(36), nullable=True)
+    run_id = Column(String(64), nullable=True)
+    feature = Column(String(80), nullable=False)
+    operation = Column(String(80), nullable=True)
+    provider = Column(String(20), nullable=True)
+    model = Column(String(200), nullable=True)
+    prompt_tokens = Column(Integer, nullable=False, default=0, server_default="0")
+    completion_tokens = Column(Integer, nullable=False, default=0, server_default="0")
+    reasoning_tokens = Column(Integer, nullable=False, default=0, server_default="0")
+    total_tokens = Column(Integer, nullable=False, default=0, server_default="0")
+    cost_usd = Column(Float, nullable=True)
+    # True when the provider gave no usage (streamed replies) and tokens were estimated.
+    estimated = Column(Boolean, nullable=False, default=False, server_default="false")
+
+    __table_args__ = (
+        Index("ix_llm_usage_events_created_at", "created_at"),
+        Index("ix_llm_usage_events_user_created", "user_id", "created_at"),
+        Index("ix_llm_usage_events_feature_created", "feature", "created_at"),
+    )
+
+
+class ValidJobUserApplication(Base):
+    """Per-user mark that the user applied to this job posting (UI + persistence)."""
+    __tablename__ = "valid_job_user_applications"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    job_id = Column(String(36), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    applied_at = Column(DateTime, server_default=func.now(), nullable=False)
+    applied_by_name = Column(String(300), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "job_id", name="uq_job_user_application"),
+    )
+
+
+class ResumeBuildResult(Base):
+    """Tracks per-job tailored resume & cover letter document generation."""
+    __tablename__ = "resume_build_results"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    job_id = Column(String(36), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+    resume_docx_status = Column(String(20), default="pending", nullable=False)
+    resume_pdf_status = Column(String(20), default="pending", nullable=False)
+    cover_letter_docx_status = Column(String(20), default="pending", nullable=False)
+    cover_letter_pdf_status = Column(String(20), default="pending", nullable=False)
+
+    resume_docx_path = Column(Text, nullable=True)
+    resume_pdf_path = Column(Text, nullable=True)
+    cover_letter_docx_path = Column(Text, nullable=True)
+    cover_letter_pdf_path = Column(Text, nullable=True)
+
+    tailored_resume_data = Column(JSON, nullable=True)
+    cover_letter_data = Column(JSON, nullable=True)
+
+    content_generation_status = Column(String(20), default="pending", nullable=False)
+    content_generation_error = Column(Text, nullable=True)
+
+    output_directory = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    # This job's own document file name (same tokens as users.resume_filename_value);
+    # null uses the account rule. Applied when files are served, never on disk.
+    filename_override = Column(String(200), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("job_id", "user_id", name="uq_resume_build_job_user"),
+    )
+
+
+class PumbleConfig(Base):
+    """Per-user Pumble destination. Users may connect multiple workspaces/channels.
+
+    Jobs are posted as thread replies under a daily parent message in the
+    configured channel. parent_message_id + parent_posted_date track the
+    current day's thread root per destination.
+    """
+    __tablename__ = "pumble_config"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String(255), nullable=True)
+    api_key_encrypted = Column(Text, nullable=False)
+    workspace_id = Column(String(255), nullable=True)
+    channel_id = Column(String(255), nullable=False)
+    channel_name = Column(String(255), nullable=False)
+    parent_message_id = Column(String(255), nullable=True)
+    parent_posted_date = Column(Date, nullable=True)
+    is_enabled = Column(Boolean, default=True, nullable=False)
+    auto_post_threshold = Column(Integer, default=75)
+    # Auto-post filters JSON: work_modes[], exclude_companies[].
+    auto_post_filters = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "channel_id", name="uq_pumble_config_user_channel"),
+    )
+
+
+class GmailConnection(Base):
+    """Per-user Gmail OAuth connection for read-only inbox search.
+
+    Tokens are Fernet-encrypted at rest. Scopes must stay read-only
+    (gmail.readonly); the service never requests send/modify scopes.
+    """
+    __tablename__ = "gmail_connections"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    google_email = Column(String(255), nullable=False)
+    refresh_token_encrypted = Column(Text, nullable=False)
+    access_token_encrypted = Column(Text, nullable=True)
+    access_token_expires_at = Column(DateTime, nullable=True)
+    scopes = Column(Text, nullable=False)
+    is_enabled = Column(Boolean, default=True, nullable=False)
+    # connected | needs_reauth
+    status = Column(String(32), default="connected", nullable=False)
+    last_error = Column(Text, nullable=True)
+    connected_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class MailConnection(Base):
+    """Per-user mailbox connected through Nylas v3 hosted auth.
+
+    Nylas holds and refreshes the provider tokens; we keep only the grant id
+    and call the API with the server's Nylas API key. Sync state lives here so
+    the Interviews page can show progress without a separate job table.
+    """
+    __tablename__ = "mail_connections"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    grant_id = Column(String(255), nullable=False)
+    email = Column(String(255), nullable=False)
+    provider = Column(String(50), nullable=True)
+    # connected | needs_reauth
+    status = Column(String(32), default="connected", nullable=False)
+    last_error = Column(Text, nullable=True)
+    # idle | running | error
+    sync_status = Column(String(16), default="idle", nullable=False)
+    sync_started_at = Column(DateTime, nullable=True)
+    last_synced_at = Column(DateTime, nullable=True)
+    last_sync_error = Column(Text, nullable=True)
+    # Newest message timestamp already scanned; next sync reads after it.
+    sync_cursor = Column(DateTime, nullable=True)
+    last_sync_stats = Column(JSON, nullable=True)
+    connected_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class InterviewProcess(Base):
+    """One hiring process (company + role) built from interview emails or added by hand."""
+    __tablename__ = "interview_processes"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    company = Column(String(300), nullable=False)
+    company_key = Column(String(300), nullable=False)
+    role_title = Column(String(300), nullable=True)
+    job_id = Column(String(36), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    # applied | screening | assessment | interviewing | final | offer | rejected | withdrawn
+    stage = Column(String(20), default="screening", nullable=False)
+    # active | closed
+    status = Column(String(16), default="active", nullable=False)
+    next_step = Column(Text, nullable=True)
+    remaining_steps = Column(JSON, nullable=True)
+    notes = Column(Text, nullable=True)
+    # email | manual
+    source = Column(String(16), default="email", nullable=False)
+    last_activity_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_interview_processes_user_company", "user_id", "company_key"),
+    )
+
+
+class InterviewEvent(Base):
+    """A single step in a process: a scheduled round, a request, an offer or a rejection."""
+    __tablename__ = "interview_events"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    process_id = Column(String(36), ForeignKey("interview_processes.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    kind = Column(String(32), nullable=False)
+    # scheduled | needs_scheduling | action_required | completed | cancelled | info
+    status = Column(String(24), default="info", nullable=False)
+    title = Column(String(300), nullable=True)
+    scheduled_at = Column(DateTime, nullable=True)
+    duration_minutes = Column(Integer, nullable=True)
+    meeting_url = Column(Text, nullable=True)
+    location = Column(String(500), nullable=True)
+    interviewers = Column(String(500), nullable=True)
+    summary = Column(Text, nullable=True)
+    message_id = Column(String(255), nullable=True)
+    thread_id = Column(String(255), nullable=True)
+    email_subject = Column(String(500), nullable=True)
+    email_from = Column(String(500), nullable=True)
+    email_date = Column(DateTime, nullable=True)
+    # Set by the user; sync never clears it, so an ignored request stays out of "needs your action".
+    ignored_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "message_id", name="uq_interview_event_user_message"),
+    )
+
+
+class MailApplication(Base):
+    """An application confirmation email ("thanks for applying") from the user's inbox.
+
+    These count as applications even when the job was never in NAO. ``job_id``
+    is the one job this email confirms (marked applied by the user or from this
+    email); ``linked_job_ids`` remembers it so a later "unmark" is not undone
+    by the next sync.
+    """
+    __tablename__ = "mail_applications"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    company = Column(String(300), nullable=False)
+    company_key = Column(String(300), nullable=False)
+    role_title = Column(String(300), nullable=True)
+    applied_at = Column(DateTime, nullable=False)
+    message_id = Column(String(255), nullable=False)
+    thread_id = Column(String(255), nullable=True)
+    email_subject = Column(String(500), nullable=True)
+    email_from = Column(String(500), nullable=True)
+    job_id = Column(String(36), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
+    linked_job_ids = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "message_id", name="uq_mail_application_user_message"),
+        Index("ix_mail_applications_user_company", "user_id", "company_key"),
+        Index("ix_mail_applications_user_applied", "user_id", "applied_at"),
+    )
+
+
+class ReportShare(Base):
+    """Read-only access for one NAO account (the viewer) to the owner's interview and application report.
+
+    ``email`` is the viewer's account email when the share was made, kept for display.
+    """
+    __tablename__ = "report_shares"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    viewer_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    email = Column(String(255), nullable=False)
+    include_notes = Column(Boolean, default=False, nullable=False)
+    message = Column(String(500), nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    last_viewed_at = Column(DateTime, nullable=True)
+    view_count = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("owner_id", "viewer_id", name="uq_report_share_owner_viewer"),
+    )
+
+
+class GoogleSheetsConfig(Base):
+    """Per-user Google Sheets integration settings.
+
+    tab_groups stores a list of groups, where each group is a list of tab names.
+    E.g. [["CHELL", "Victor"], ["Adekunle", "Elsie"]]
+    Jobs round-robin between groups; all tabs in a group receive the same URL.
+    """
+    __tablename__ = "google_sheets_config"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    spreadsheet_url = Column(Text, nullable=False)
+    spreadsheet_id = Column(String(255), nullable=False)
+    tab_groups = Column(JSON, default=list)
+    round_robin_index = Column(Integer, default=0)
+    auto_post_threshold = Column(Integer, default=75)
+    # Soft toggle: disable auto-post without deleting spreadsheet URL / tab groups.
+    is_enabled = Column(Boolean, default=True, nullable=False)
+    # Auto-post filters JSON: work_modes[], exclude_companies[].
+    auto_post_filters = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class ApplicationSession(Base):
+    """Per-user in-progress job application worked on through the assistant
+    extension. Holds a snapshot of the structured job description so the
+    extension can keep working (and chatting) about a job until the user
+    completes or removes it. One session per (user, job).
+    """
+    __tablename__ = "application_sessions"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    job_id = Column(String(36), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    # "in_progress" while the user is applying; "completed" once they finish.
+    status = Column(String(20), default="in_progress", nullable=False, server_default="in_progress")
+    # Snapshot of the structured JD (title/company/responsibilities/...) at the
+    # time the session started, so it stays stable for the duration of applying.
+    job_snapshot = Column(JSON, nullable=True)
+    job_url = Column(Text, nullable=True)
+    job_title = Column(String(500), nullable=True)
+    company = Column(String(500), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "job_id", name="uq_application_session_user_job"),
+        Index("ix_application_sessions_user_status", "user_id", "status"),
+    )
+
+
+class AssistantMessage(Base):
+    """A single turn in the job-specific assistant conversation. The
+    conversation is identified by (user_id, job_id); messages are ordered by
+    created_at. Persisted so reopening a job restores the chat.
+    """
+    __tablename__ = "assistant_messages"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    job_id = Column(String(36), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(String(20), nullable=False)  # "user" | "assistant"
+    content = Column(Text, nullable=False)
+    # Optional answer-style metadata used to render the question that produced
+    # this answer (e.g. {"style": "concise", "field_type": "textarea"}).
+    meta = Column(JSON, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_assistant_messages_user_job", "user_id", "job_id", "created_at"),
+    )
+
+
+class ResumeAiChatSession(Base):
+    """OneClick AI conversation scoped to a library resume (Resume Studio).
+
+    Messages are ``[{role, content}, ...]``. Reopening the studio AI rail for
+    the same resume restores the thread and the last job description used.
+    """
+
+    __tablename__ = "resume_ai_chat_sessions"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    resume_id = Column(
+        String(36),
+        ForeignKey("resume_documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    messages = Column(JSON, nullable=False, default=list)
+    last_job_description = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "resume_id", name="uq_resume_ai_chat_user_resume"),
+        Index("ix_resume_ai_chat_sessions_user_updated", "user_id", "updated_at"),
+    )
+
+
+class AgentChatSession(Base):
+    """One conversation with the in-app assistant. ``items`` is the rendered
+    timeline (user and assistant turns, tool rows, confirmations), so reopening
+    a chat shows exactly what the user saw. Kept until the user deletes it.
+    """
+    __tablename__ = "agent_chat_sessions"
+
+    id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    title = Column(String(200), nullable=False, server_default="New chat")
+    items = Column(JSON, nullable=False)
+    item_count = Column(Integer, nullable=False, server_default="0")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_agent_chat_sessions_user_updated", "user_id", "updated_at"),
+    )
+
+
+class UserPackage(Base):
+    """A purchased or granted package sitting in someone's store until it is used.
+
+    Credit packages turn into balance when redeemed; a TEAM package turns into
+    one team space. A gift to an email with no account waits with
+    ``owner_user_id`` NULL and is claimed when that email signs up.
+    """
+    __tablename__ = "user_packages"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    code = Column(String(20), nullable=False)
+    # credits | team
+    kind = Column(String(16), nullable=False)
+    credits = Column(Integer, nullable=False, server_default="0")
+    price_cents = Column(Integer, nullable=False, server_default="0")
+    owner_user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    owner_email = Column(String(255), nullable=True, index=True)
+    # held | redeemed | revoked
+    status = Column(String(16), nullable=False, server_default="held")
+    # admin_grant | purchase | gift
+    source = Column(String(16), nullable=False, server_default="admin_grant")
+    gifted_from_user_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    granted_by_user_id = Column(String(36), nullable=True)
+    # Admin message shown to the recipient with a granted package.
+    note = Column(String(300), nullable=True)
+    redeemed_at = Column(DateTime, nullable=True)
+    redeemed_ref = Column(String(36), nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_by_user_id = Column(String(36), nullable=True)
+    revoke_reason = Column(String(300), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class CreditLedgerEntry(Base):
+    """Every change to a user's credit balance, newest last."""
+    __tablename__ = "credit_ledger"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    delta = Column(Integer, nullable=False)
+    balance_after = Column(Integer, nullable=False)
+    # signup_bonus | package | admin_adjust
+    reason = Column(String(32), nullable=False)
+    ref_id = Column(String(36), nullable=True)
+    note = Column(String(300), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_credit_ledger_user_created", "user_id", "created_at"),
+    )
+
+
+class TeamSpace(Base):
+    """A team created from one TEAM package. The owner is the team lead."""
+    __tablename__ = "team_spaces"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    # Shown to people: "nao-" plus 8 digits.
+    public_id = Column(String(12), nullable=False, unique=True)
+    name = Column(String(80), nullable=False)
+    owner_user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    package_id = Column(String(36), ForeignKey("user_packages.id", ondelete="SET NULL"), nullable=True, unique=True)
+    # Applied to people when they join; NULL default leaves their own choice.
+    default_share_scope = Column(String(16), nullable=True)
+    default_share_locked = Column(Boolean, nullable=False, server_default="false")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class TeamMember(Base):
+    """A member of a team space. A person can be on several spaces; the lead is not a member row."""
+    __tablename__ = "team_members"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    team_space_id = Column(String(36), ForeignKey("team_spaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # When locked, the member's job_share_default is pinned to this value.
+    share_locked = Column(Boolean, nullable=False, server_default="false")
+    joined_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("team_space_id", "user_id", name="uq_team_members_space_user"),)
+
+
+class TeamInvite(Base):
+    """An invitation by email. It works for emails that sign up later too."""
+    __tablename__ = "team_invites"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    team_space_id = Column(String(36), ForeignKey("team_spaces.id", ondelete="CASCADE"), nullable=False, index=True)
+    email = Column(String(255), nullable=False, index=True)
+    invited_by_user_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # pending | accepted | declined | revoked
+    status = Column(String(16), nullable=False, server_default="pending")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    responded_at = Column(DateTime, nullable=True)
+
+
+class SystemSetting(Base):
+    """DB overrides for allowlisted Settings fields (admin System Settings)."""
+
+    __tablename__ = "system_settings"
+
+    key = Column(String(100), primary_key=True)
+    value = Column(Text, nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+    updated_by_user_id = Column(String(36), nullable=True)
+
+
+class BlockedDomain(Base):
+    """Domains that reject auto job extraction (admin-managed)."""
+
+    __tablename__ = "blocked_domains"
+
+    domain = Column(String(255), primary_key=True)
+    reason = Column(Text, nullable=False)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+class LlmProviderKey(Base):
+    """Admin-managed API key pool entry for a single LLM provider."""
+
+    __tablename__ = "llm_provider_keys"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    provider = Column(String(20), nullable=False, index=True)  # openai | anthropic | gemini
+    label = Column(String(100), nullable=False)
+    api_key_encrypted = Column(Text, nullable=False)
+    key_hint = Column(String(32), nullable=True)
+    is_enabled = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+    created_by_user_id = Column(String(36), nullable=True)
+
+    __table_args__ = (
+        Index("ix_llm_provider_keys_provider_label", "provider", "label", unique=True),
+    )
+
+
+class LlmJobBinding(Base):
+    """Maps a platform LLM job type to a provider key and optional model id.
+
+    ``model`` is especially important for OpenAI-compatible gateways where one
+    API key can access many models (discovered via GET /v1/models).
+    """
+
+    __tablename__ = "llm_job_bindings"
+
+    job_type = Column(String(50), primary_key=True)
+    provider_key_id = Column(
+        String(36),
+        ForeignKey("llm_provider_keys.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    provider = Column(String(20), nullable=True)  # optional provider override
+    model = Column(String(200), nullable=True)  # optional model id for the bound provider
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+    updated_by_user_id = Column(String(36), nullable=True)

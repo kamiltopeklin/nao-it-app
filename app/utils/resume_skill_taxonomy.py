@@ -1,0 +1,908 @@
+"""Deterministic clean-up of tailored resume formatting.
+
+The tailoring prompt asks for clean single-concept skill categories, plain skill lists
+and sparse bold. Models still drift ("Frontend & Libraries", "**React**,**Vue**",
+eight bold spans in one bullet), so every tailored resume passes through
+:func:`normalize_tailored_formatting` before it is stored or rendered.
+"""
+
+from __future__ import annotations
+
+import re
+
+_BOLD_SPAN_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+# "**BrightLane** **Market**" is one name split in two; render it as one span.
+_ADJACENT_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*([ \t]+)\*\*([^*]+)\*\*")
+_ITEM_SPLIT_RE = re.compile(r"\s*[,;|\n\u00b7\u2022]+\s*")
+# Split compound category names on "&", "and", "+" and spaced slashes. "CI/CD" and
+# "AI/ML" keep their unspaced slash.
+_CATEGORY_JOIN_RE = re.compile(r"\s*(?:&|\+|\band\b|\s/\s|,)\s*", re.IGNORECASE)
+
+# Words that never carry meaning in a category name on their own.
+_FILLER_PARTS = frozenset(
+    {
+        "libraries", "library", "frameworks", "framework", "apis", "api", "storage",
+        "tools", "tooling", "tool", "platforms", "platform", "services", "service",
+        "technologies", "technology", "tech", "systems", "ecosystem", "stack",
+        "utilities", "misc", "others", "other", "solutions", "software",
+    }
+)
+
+_GENERIC_NAMES = frozenset(
+    {
+        "skills", "technical skills", "other", "others", "miscellaneous", "misc",
+        "general", "core", "core skills", "soft skills", "additional", "additional skills",
+    }
+)
+
+# Canonical spelling for common category names (lower-case key).
+_CANONICAL_NAMES: dict[str, str] = {
+    "front end": "Frontend",
+    "front-end": "Frontend",
+    "frontend": "Frontend",
+    "frontend development": "Frontend",
+    "ui": "Frontend",
+    "back end": "Backend",
+    "back-end": "Backend",
+    "backend": "Backend",
+    "backend development": "Backend",
+    "server side": "Backend",
+    "server-side": "Backend",
+    "apis": "Backend",
+    "api": "Backend",
+    "programming languages": "Languages",
+    "programming": "Languages",
+    "languages": "Languages",
+    "language": "Languages",
+    "database": "Databases",
+    "databases": "Databases",
+    "data stores": "Databases",
+    "datastores": "Databases",
+    "cloud": "Cloud",
+    "cloud computing": "Cloud",
+    "cloud platforms": "Cloud",
+    "devops": "DevOps",
+    "dev ops": "DevOps",
+    "tooling": "DevOps",
+    "version control": "DevOps",
+    "ci/cd": "CI/CD",
+    "ci cd": "CI/CD",
+    "testing": "Testing",
+    "testing & qa": "Testing",
+    "qa": "Testing",
+    "quality assurance": "Testing",
+    "quality": "Testing",
+    "automation": "Testing",
+    "messaging": "Messaging",
+    "message queues": "Messaging",
+    "streaming": "Streaming",
+    "monitoring": "Observability",
+    "observability": "Observability",
+    "ml": "Machine Learning",
+    "machine learning": "Machine Learning",
+    "ai/ml": "Machine Learning",
+    "ml/ai": "Machine Learning",
+    "mlops": "MLOps",
+    "llm": "LLMs",
+    "llms": "LLMs",
+    "mobile": "Mobile",
+    "infrastructure": "Infrastructure",
+    "iac": "Infrastructure as Code",
+    "infrastructure as code": "Infrastructure as Code",
+    "containers": "Containers",
+    "containerization": "Containers",
+    "security": "Security",
+    "compliance": "Security",
+    "data": "Data",
+    "data engineering": "Data Engineering",
+    "pipelines": "Data Engineering",
+    "big data": "Data Engineering",
+    "data processing": "Data Engineering",
+    "data warehousing": "Data Engineering",
+    "data practices": "Data",
+    "analytics": "Analytics",
+    "analytics practices": "Analytics",
+    "bi": "Analytics",
+    "spreadsheets": "Analytics",
+    "embedded": "Embedded",
+    "embedded platforms": "Embedded",
+    "rtos": "Embedded",
+    "interfaces": "Embedded",
+    "processes": "Tools",
+    "developer": "Tools",
+    "product practices": "Product",
+    "product": "Product",
+    "product management": "Product",
+    "orchestration": "Data Engineering",
+    "web": "Backend",
+    "methods": "Tools",
+    "excel": "Analytics",
+    "experimentation": "Analytics",
+    "debug": "Tools",
+    "standards": "Tools",
+    "customer": "Tools",
+    "devsecops": "Security",
+}
+
+# When both parts survive, a broad part absorbs a narrower one ("DevOps & CI/CD" -> "DevOps").
+_ABSORBS: dict[str, frozenset[str]] = {
+    "DevOps": frozenset({"CI/CD", "Infrastructure", "Containers", "Automation", "Deployment"}),
+    "Cloud": frozenset({"Infrastructure", "Hosting"}),
+    "Backend": frozenset({"Microservices", "Server", "Web Services", "Rest", "Graphql"}),
+    "Frontend": frozenset({"UI", "Ui", "Web", "Styling", "State Management"}),
+    "Databases": frozenset({"Caching", "Data", "Sql", "Nosql", "Orm"}),
+    "Machine Learning": frozenset({"AI", "Ai", "Data Science"}),
+    "Testing": frozenset({"QA", "Qa", "Quality"}),
+    "Observability": frozenset({"Monitoring", "Logging"}),
+}
+
+_SMALL_WORDS = frozenset({"as", "of", "and", "for", "in", "on", "to"})
+
+
+def strip_bold_markers(text: str) -> str:
+    return (text or "").replace("**", "")
+
+
+def normalize_skill_list(raw: str) -> str:
+    """Plain, de-duplicated items joined with ", " ("A,B ; **C**" -> "A, B, C")."""
+    items: list[str] = []
+    seen: set[str] = set()
+    for part in _ITEM_SPLIT_RE.split(strip_bold_markers(raw)):
+        item = part.strip(" \t").rstrip(".").strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+    return ", ".join(items)
+
+
+def _title_part(part: str) -> str:
+    words = part.split()
+    out: list[str] = []
+    for i, w in enumerate(words):
+        if any(ch.isupper() for ch in w[1:]) or "/" in w or "." in w:
+            out.append(w)  # keep DevOps, CI/CD, Node.js as written
+        elif i > 0 and w.lower() in _SMALL_WORDS:
+            out.append(w.lower())
+        else:
+            out.append(w[:1].upper() + w[1:])
+    return " ".join(out)
+
+
+def _canonical_part(part: str) -> str:
+    cleaned = re.sub(r"\s+", " ", part.strip(" -:()")).strip()
+    if not cleaned:
+        return ""
+    key = cleaned.lower()
+    if key in _CANONICAL_NAMES:
+        return _CANONICAL_NAMES[key]
+    if key in _FILLER_PARTS:
+        return ""
+    # Drop trailing filler only when a known name remains ("Cloud Platforms" -> "Cloud",
+    # "Frontend Libraries" -> "Frontend"); "Build Tools" stays as written.
+    words = cleaned.split()
+    while len(words) > 1 and words[-1].lower() in _FILLER_PARTS:
+        words.pop()
+        trimmed = " ".join(words).lower()
+        if trimmed in _CANONICAL_NAMES:
+            return _CANONICAL_NAMES[trimmed]
+    return _title_part(cleaned)
+
+
+def category_parts(name: str) -> list[str]:
+    """Meaningful canonical parts of a category name, filler and absorbed parts removed."""
+    raw = strip_bold_markers(name).strip().rstrip(":")
+    if not raw:
+        return []
+    parts: list[str] = []
+    for x in _CATEGORY_JOIN_RE.split(raw):
+        p = _canonical_part(x)
+        if p and p.lower() not in {q.lower() for q in parts}:
+            parts.append(p)
+    if len(parts) >= 2:
+        kept = [
+            p for p in parts
+            if not any(p in _ABSORBS.get(other, frozenset()) for other in parts if other != p)
+        ]
+        parts = kept or parts
+    if not parts:
+        return [_title_part(raw)]
+    return parts
+
+
+def normalize_skill_category(name: str) -> str:
+    """Clean, professional category name: "Frontend & Libraries" -> "Frontend",
+    "Database & Storage" -> "Databases", "DevOps & CI/CD" -> "DevOps"."""
+    parts = category_parts(name)
+    return " & ".join(parts[:2]) if parts else ""
+
+
+# Recognisable technologies per category, used to split a compound category
+# ("Cloud & DevOps") into its single-concept parts. Matched case-insensitively
+# against the start of each item.
+_LEXICON: dict[str, tuple[str, ...]] = {
+    "Cloud": (
+        "aws", "amazon", "azure", "gcp", "google cloud", "lambda", "s3", "ec2", "ecs", "eks",
+        "cloudfront", "dynamodb", "sqs", "sns", "rds", "cloud run", "bigquery", "firebase",
+        "heroku", "vercel", "netlify", "digitalocean", "cloudflare", "oci", "ibm cloud",
+    ),
+    "DevOps": (
+        "docker", "kubernetes", "k8s", "helm", "terraform", "ansible", "pulumi", "jenkins",
+        "github actions", "gitlab", "circleci", "argo", "ci/cd", "travis", "bitbucket pipelines",
+        "chef", "puppet", "nginx", "linux", "bash", "openshift", "istio", "packer", "vault",
+    ),
+    "Databases": (
+        "postgres", "mysql", "mariadb", "mongodb", "redis", "sqlite", "oracle", "sql server",
+        "mssql", "cassandra", "dynamodb", "elasticsearch", "opensearch", "neo4j", "couchbase",
+        "cockroach", "supabase", "snowflake", "clickhouse", "memcached", "prisma", "sqlalchemy",
+        "hibernate", "typeorm", "sequelize", "pinecone", "pgvector", "weaviate", "milvus",
+        "cosmos", "azure cosmos", "azure sql", "timescale", "influx", "amazon timestream", "amazon rds",
+        "aurora", "bigtable", "firestore", "spanner",
+    ),
+    "Messaging": ("kafka", "rabbitmq", "sqs", "sns", "pub/sub", "nats", "activemq", "kinesis", "celery", "zeromq"),
+    "Observability": (
+        "datadog", "prometheus", "grafana", "new relic", "splunk", "sentry", "elk", "kibana",
+        "opentelemetry", "jaeger", "cloudwatch", "pagerduty", "loki", "honeycomb",
+    ),
+    "Testing": (
+        "jest", "vitest", "mocha", "cypress", "playwright", "selenium", "pytest", "junit",
+        "testng", "rspec", "testing library", "enzyme", "postman", "k6", "jmeter", "cucumber",
+    ),
+    "Frontend": (
+        "react", "next.js", "vue", "nuxt", "angular", "svelte", "redux", "tailwind", "html",
+        "css", "sass", "webpack", "vite", "jquery", "material ui", "mui", "bootstrap",
+        "storybook", "zustand", "react query", "chakra",
+    ),
+    "Backend": (
+        "node", "express", "nestjs", "django", "flask", "fastapi", "spring", "rails", ".net",
+        "asp.net", "laravel", "graphql", "rest", "grpc", "gin", "fiber", "koa", "hapi", "phoenix",
+    ),
+    "Languages": (
+        "python", "javascript", "typescript", "java", "go", "golang", "rust", "c#", "c++",
+        "ruby", "php", "kotlin", "swift", "scala", "sql", "r", "dart", "elixir", "bash",
+    ),
+    "Security": (
+        "iam", "kms", "security hub", "guardduty", "cloudtrail", "siem", "splunk", "okta",
+        "oauth", "soc 2", "soc2", "nist", "cis", "fedramp", "devsecops", "cloud security",
+        "vulnerability",
+    ),
+    "Data Engineering": (
+        "spark", "airflow", "dbt", "glue", "hadoop", "kafka", "flink", "snowflake", "redshift",
+        "bigquery", "parquet", "etl", "elt", "fivetran", "ssis", "emr",
+    ),
+    "Analytics": (
+        "tableau", "looker", "power bi", "excel", "google sheets", "mixpanel", "amplitude",
+        "google analytics", "mode", "a/b testing", "cohort",
+    ),
+    "Embedded": (
+        "freertos", "zephyr", "arm", "stm32", "nordic", "ble", "spi", "i2c", "uart", "gpio",
+        "jtag", "swd",
+    ),
+    "MLOps": ("mlflow", "kubeflow", "sagemaker", "vertex ai", "feature store"),
+    "Product": ("jira", "confluence", "figma", "miro", "prd", "roadmap", "salesforce"),
+}
+
+
+def _lexicon_home(item: str, candidates: list[str]) -> str | None:
+    low = item.lower()
+    for cat in candidates:
+        for term in _LEXICON.get(cat, ()):
+            if low == term or low.startswith(term + " ") or low.startswith(term):
+                if len(term) <= 2 and low != term:
+                    continue  # "r", "go" must match exactly
+                if len(term) <= 3 and low[len(term) : len(term) + 1].isalnum():
+                    continue  # "sql" is not "SQLAlchemy"
+                return cat
+    return None
+
+
+def fold_small_skill_rows(skills: list[dict], minimum: int = 3) -> list[dict]:
+    """Move the items of a row under *minimum* into the larger categories the lexicon files them under."""
+    rows = [dict(r) for r in skills or [] if isinstance(r, dict)]
+    buckets = [[i for i in normalize_skill_list(str(r.get("skills") or "")).split(", ") if i] for r in rows]
+    names = [str(r.get("category") or "") for r in rows]
+    for idx, items in enumerate(buckets):
+        if not items or len(items) >= minimum:
+            continue
+        targets = [n for j, n in enumerate(names) if j != idx and len(buckets[j]) >= minimum]
+        keep: list[str] = []
+        for item in items:
+            home = _lexicon_home(item, targets)
+            if home:
+                buckets[names.index(home)].append(item)
+            else:
+                keep.append(item)
+        buckets[idx] = keep
+    return [{**r, "skills": ", ".join(b)} for r, b in zip(rows, buckets) if b]
+
+
+# Professional resume spelling for lexicon canonical keys and common aliases.
+_SKILL_DISPLAY: dict[str, str] = {
+    "aws": "AWS",
+    "amazon web services": "AWS",
+    "amazon s3": "Amazon S3",
+    "amazon sqs": "Amazon SQS",
+    "amazon sns": "Amazon SNS",
+    "amazon ec2": "Amazon EC2",
+    "aws lambda": "AWS Lambda",
+    "aws networking": "AWS Networking",
+    "gcp": "GCP",
+    "sql": "SQL",
+    "html": "HTML",
+    "html5": "HTML5",
+    "css": "CSS",
+    "css3": "CSS3",
+    "typescript": "TypeScript",
+    "javascript": "JavaScript",
+    "python": "Python",
+    "java": "Java",
+    "c#": "C#",
+    "c++": "C++",
+    "go": "Go",
+    "golang": "Go",
+    "rust": "Rust",
+    "kotlin": "Kotlin",
+    "swift": "Swift",
+    "bash": "Bash",
+    "powershell": "PowerShell",
+    "kafka": "Kafka",
+    "apache kafka": "Apache Kafka",
+    "postgresql": "PostgreSQL",
+    "postgres": "PostgreSQL",
+    "mongodb": "MongoDB",
+    "mysql": "MySQL",
+    "redis": "Redis",
+    "elasticsearch": "Elasticsearch",
+    "dynamodb": "DynamoDB",
+    "sql server": "SQL Server",
+    "mssql": "SQL Server",
+    "node.js": "Node.js",
+    "nodejs": "Node.js",
+    "node": "Node.js",
+    "next.js": "Next.js",
+    "express.js": "Express.js",
+    "express": "Express.js",
+    "react": "React",
+    "react native": "React Native",
+    "angular": "Angular",
+    "vue": "Vue",
+    "vue.js": "Vue.js",
+    "jquery": "jQuery",
+    "graphql": "GraphQL",
+    "rest": "REST",
+    "rest apis": "REST APIs",
+    "rest api": "REST APIs",
+    "grpc": "gRPC",
+    "ci/cd": "CI/CD",
+    "git": "Git",
+    "github": "GitHub",
+    "github actions": "GitHub Actions",
+    "gitlab": "GitLab",
+    "docker": "Docker",
+    "kubernetes": "Kubernetes",
+    "k8s": "Kubernetes",
+    "terraform": "Terraform",
+    "ansible": "Ansible",
+    "jenkins": "Jenkins",
+    "linux": "Linux",
+    ".net": ".NET",
+    ".net core": ".NET Core",
+    "asp.net": "ASP.NET",
+    "asp.net core": "ASP.NET Core",
+    "fastapi": "FastAPI",
+    "django": "Django",
+    "flask": "Flask",
+    "spring": "Spring",
+    "spring boot": "Spring Boot",
+    "pytest": "pytest",
+    "jest": "Jest",
+    "xunit": "xUnit",
+    "playwright": "Playwright",
+    "cypress": "Cypress",
+    "selenium": "Selenium",
+    "azure": "Azure",
+    "iam": "IAM",
+    "s3": "S3",
+    "ec2": "EC2",
+    "rds": "RDS",
+    "sqs": "SQS",
+    "sns": "SNS",
+    "lambda": "Lambda",
+    "oauth": "OAuth",
+    "oidc": "OIDC",
+    "saml": "SAML",
+    "jwt": "JWT",
+    "llm": "LLM",
+    "llms": "LLMs",
+    "ai": "AI",
+    "ml": "ML",
+    "mlops": "MLOps",
+    "etl": "ETL",
+    "elt": "ELT",
+    "iac": "IaC",
+    "sre": "SRE",
+    "api": "API",
+    "apis": "APIs",
+    "db2": "DB2",
+    "nosql": "NoSQL",
+    "microservices": "Microservices",
+    "event-driven": "Event-driven",
+    "rabbitmq": "RabbitMQ",
+    "datadog": "Datadog",
+    "pagerduty": "PagerDuty",
+    "splunk": "Splunk",
+    "prometheus": "Prometheus",
+    "grafana": "Grafana",
+    "opentelemetry": "OpenTelemetry",
+    "application insights": "Application Insights",
+    "active directory": "Active Directory",
+    "scikit-learn": "scikit-learn",
+    "pytorch": "PyTorch",
+    "tensorflow": "TensorFlow",
+    "rxjs": "RxJS",
+    "scss": "SCSS",
+    "sass": "Sass",
+    "redux": "Redux",
+    "webpack": "Webpack",
+    "vite": "Vite",
+    "tailwind css": "Tailwind CSS",
+    "bootstrap": "Bootstrap",
+    "jira": "Jira",
+    "confluence": "Confluence",
+    "figma": "Figma",
+    "airflow": "Airflow",
+    "spark": "Spark",
+    "dbt": "dbt",
+    "snowflake": "Snowflake",
+    "clickhouse": "ClickHouse",
+    "bigquery": "BigQuery",
+    "tableau": "Tableau",
+    "looker": "Looker",
+    "power bi": "Power BI",
+    "nginx": "Nginx",
+    "helm": "Helm",
+    "istio": "Istio",
+    "vault": "Vault",
+    "pulumi": "Pulumi",
+    "packer": "Packer",
+    "mlflow": "MLflow",
+    "kubeflow": "Kubeflow",
+    "sagemaker": "SageMaker",
+}
+
+# Employment / ATS junk labels (case-insensitive). Kept separate from CamelCase mashup
+# patterns: Python rejects inline (?i) after the start of an expression, and a global
+# IGNORECASE would make the mashup patterns match ordinary tech names like "python".
+_JUNK_SKILL_LABELS_RE = re.compile(
+    r"^(?:c2c|w2|1099|corp[- ]?to[- ]?corp|contract(?:or)?|full[- ]?time|part[- ]?time|"
+    r"remote(?:new)?|onsite|hybrid|agentic|"
+    r".*contractor|loginregister|talentnet|cloudops)$",
+    re.IGNORECASE,
+)
+# CamelCase mashups such as CapgeminiCONTRACTOR / YorkNYUS (case-sensitive).
+_JUNK_SKILL_MASHUP_RE = re.compile(
+    r"^[A-Z][a-z]+(?:[A-Z]{2,}[A-Za-z]*)+$|"
+    r"^[A-Z]{2,}[a-z]+[A-Z]{2,}"
+)
+
+# Resume-standard category order (not JD-highlight order).
+_CATEGORY_ORDER: tuple[str, ...] = (
+    "Languages",
+    "Backend",
+    "Frontend",
+    "Mobile",
+    "Cloud",
+    "Databases",
+    "Data Engineering",
+    "Data",
+    "DevOps",
+    "Infrastructure as Code",
+    "Infrastructure",
+    "Containers",
+    "Messaging",
+    "Streaming",
+    "Observability",
+    "Machine Learning",
+    "MLOps",
+    "LLMs",
+    "Security",
+    "Testing",
+    "Analytics",
+    "Embedded",
+    "Product",
+    "Tools",
+)
+
+
+def professional_skill_label(item: str) -> str:
+    """Professional resume spelling: aws -> AWS, kafka -> Kafka, typescript -> TypeScript."""
+    raw = strip_bold_markers(item or "").strip().rstrip(".")
+    if not raw:
+        return ""
+    key = re.sub(r"\s+", " ", raw).strip().lower()
+    if key in _SKILL_DISPLAY:
+        return _SKILL_DISPLAY[key]
+    # Qualifiers: "typescript (basic)" -> "TypeScript (basic)"
+    m = re.match(r"^(.+?)\s*(\([^)]*\))\s*$", raw)
+    if m:
+        base = professional_skill_label(m.group(1))
+        return f"{base} {m.group(2).strip()}" if base else raw
+    # Multi-word vendor names: title each token; do not collapse "Amazon SQS" to "SQS".
+    if " " in key:
+        parts = []
+        for w in raw.split():
+            lk = w.lower()
+            if lk in _SKILL_DISPLAY:
+                parts.append(_SKILL_DISPLAY[lk])
+            elif w.isupper() or any(ch in ".+#" for ch in w):
+                parts.append(w)
+            else:
+                parts.append(w[:1].upper() + w[1:] if w else w)
+        return " ".join(parts)
+    try:
+        from app.services.skill_lexicon import extract_skills
+
+        hits = extract_skills(raw)
+        if len(hits) == 1:
+            canon = next(iter(hits))
+            if canon in _SKILL_DISPLAY:
+                return _SKILL_DISPLAY[canon]
+    except Exception:  # noqa: BLE001 - display must never break finalize
+        pass
+    # Already looks professional (Node.js, ASP.NET Core, GitHub Actions).
+    if any(ch.isupper() for ch in raw[1:]) or any(ch in ".+#" for ch in raw):
+        return raw[:1].upper() + raw[1:] if raw[:1].islower() and raw[:1].isalpha() else raw
+    # Short acronyms: aws, iam, sql -> AWS
+    if raw.isalpha() and 2 <= len(raw) <= 5 and raw.isupper():
+        return raw
+    if raw.isalpha() and 2 <= len(raw) <= 4 and raw.islower():
+        return raw.upper()
+    return raw[:1].upper() + raw[1:] if raw[:1].islower() and raw[:1].isalpha() else raw
+
+
+def is_junk_skill_item(item: str) -> bool:
+    """True for employment labels, ATS mashups, and non-technology noise."""
+    s = strip_bold_markers(item or "").strip()
+    if not s or len(s) > 48:
+        return True
+    if _JUNK_SKILL_LABELS_RE.fullmatch(s) or _JUNK_SKILL_MASHUP_RE.fullmatch(s):
+        return True
+    # CamelCase mashups with an embedded ALLCAPS run (CapgeminiCONTRACTOR).
+    if re.search(r"[a-z][A-Z]{2,}", s) and " " not in s and "." not in s:
+        return True
+    return False
+
+
+def filter_junk_skill_items(skills: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for row in skills or []:
+        if not isinstance(row, dict):
+            continue
+        kept = [
+            professional_skill_label(i)
+            for i in normalize_skill_list(str(row.get("skills") or "")).split(", ")
+            if i and not is_junk_skill_item(i)
+        ]
+        # De-dupe after professionalization.
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for item in kept:
+            key = item.lower()
+            if not item or key in seen:
+                continue
+            seen.add(key)
+            uniq.append(item)
+        if uniq:
+            out.append({**row, "skills": ", ".join(uniq)})
+    return out
+
+
+def order_skill_categories_professionally(skills: list[dict]) -> list[dict]:
+    """Stable professional category order; unknown names keep relative order at the end."""
+    rank = {name.lower(): i for i, name in enumerate(_CATEGORY_ORDER)}
+    indexed = list(enumerate(skills or []))
+    indexed.sort(
+        key=lambda pair: (
+            rank.get(str(pair[1].get("category") or "").lower(), len(_CATEGORY_ORDER) + pair[0]),
+            pair[0],
+        )
+    )
+    return [row for _, row in indexed if isinstance(row, dict)]
+
+
+def drop_thin_skill_categories(skills: list[dict], minimum: int) -> list[dict]:
+    """Drop categories that stay under *minimum* after fill/fold (never leave 1-2 item rows)."""
+    out: list[dict] = []
+    for row in skills or []:
+        if not isinstance(row, dict):
+            continue
+        items = [i for i in normalize_skill_list(str(row.get("skills") or "")).split(", ") if i]
+        if len(items) >= minimum:
+            out.append({**row, "skills": ", ".join(items)})
+    return out
+
+
+def polish_technical_skills(
+    skills: list[dict] | None,
+    *,
+    candidates: list[str] | None = None,
+    posting_terms: list[str] | None = None,
+    minimum: int = 6,
+    max_items: int = 56,
+    allow_related_pad: bool = True,
+) -> list[dict]:
+    """Canonicalize, spell professionally, pad thin rows, fold leftovers, order for a senior resume.
+
+    When *allow_related_pad* is False (evidence mode), only candidates already on the resume/plan
+    may top up a category; inventing related stack is skipped.
+    """
+    rows = normalize_skill_categories(skills or [])
+    rows = rehome_misplaced_skills(rows)
+    rows = filter_junk_skill_items(rows)
+    pool = [professional_skill_label(c) for c in (candidates or []) if c]
+    for term in posting_terms or []:
+        label = professional_skill_label(term)
+        if label and label.lower() not in {p.lower() for p in pool}:
+            pool.append(label)
+    rows = fill_thin_skill_rows(rows, pool, minimum, allow_related_pad=allow_related_pad)
+    rows = fold_small_skill_rows(rows, minimum=minimum)
+    rows = fill_thin_skill_rows(rows, pool, minimum, allow_related_pad=allow_related_pad)
+    rows = drop_thin_skill_categories(rows, minimum=max(3, minimum - 1) if allow_related_pad else 1)
+    # Within each category, put posting skills first; keep professional category order.
+    post_rank = {professional_skill_label(t).lower(): i for i, t in enumerate(posting_terms or [])}
+
+    def item_key(item: str) -> tuple[int, str]:
+        return (post_rank.get(item.lower(), len(post_rank) + 1), item.lower())
+
+    ordered: list[dict] = []
+    for row in order_skill_categories_professionally(rows):
+        items = sorted(
+            [i for i in normalize_skill_list(str(row.get("skills") or "")).split(", ") if i],
+            key=item_key,
+        )
+        if items:
+            ordered.append({**row, "skills": ", ".join(items)})
+    from app.utils.resume_evidence import cap_skills_section
+
+    keep = " ".join(posting_terms or [])
+    return cap_skills_section(ordered, keep, limit=max_items)
+
+
+# Related stack used to top up thin categories for senior resumes (category-correct only).
+_CATEGORY_PAD: dict[str, tuple[str, ...]] = {
+    "Languages": ("Python", "TypeScript", "JavaScript", "SQL", "Bash", "Go", "C#", "Java"),
+    "Backend": ("Node.js", "REST APIs", "GraphQL", "Express.js", "Microservices", "gRPC", "ASP.NET Core", ".NET"),
+    "Frontend": ("React", "TypeScript", "JavaScript", "HTML", "CSS", "Next.js", "Redux", "Angular"),
+    "Mobile": ("React Native", "iOS", "Android", "Swift", "Kotlin", "TypeScript"),
+    "Cloud": ("AWS", "Azure", "GCP", "Amazon S3", "AWS Lambda", "IAM"),
+    "Databases": ("PostgreSQL", "MySQL", "MongoDB", "Redis", "SQL Server", "DynamoDB"),
+    "Data Engineering": ("Apache Kafka", "Airflow", "Spark", "dbt", "ETL", "Snowflake"),
+    "DevOps": ("Docker", "Kubernetes", "Terraform", "CI/CD", "GitHub Actions", "Linux", "Git"),
+    "Infrastructure as Code": ("Terraform", "Pulumi", "Ansible", "CloudFormation", "Packer"),
+    "Messaging": ("Apache Kafka", "RabbitMQ", "SQS", "SNS", "Redis"),
+    "Observability": ("Prometheus", "Grafana", "Datadog", "Splunk", "OpenTelemetry", "CloudWatch"),
+    "Machine Learning": ("Python", "PyTorch", "TensorFlow", "LLM", "scikit-learn", "MLOps"),
+    "MLOps": ("MLflow", "Kubeflow", "SageMaker", "Docker", "Kubernetes"),
+    "Security": ("IAM", "OAuth", "OIDC", "SAML", "Secrets Manager", "TLS"),
+    "Testing": ("Jest", "pytest", "Playwright", "Cypress", "xUnit", "Postman", "Unit Testing"),
+    "Analytics": ("SQL", "Tableau", "Looker", "Power BI", "Excel", "Python"),
+    "Embedded": ("C", "C++", "Linux", "ARM", "FreeRTOS", "SPI"),
+    "Product": ("Jira", "Confluence", "Figma", "Agile", "Roadmapping"),
+}
+
+
+def fill_thin_skill_rows(
+    skills: list[dict],
+    candidates: list[str],
+    minimum: int,
+    *,
+    allow_related_pad: bool = True,
+) -> list[dict]:
+    """Top up categories under *minimum* items from *candidates*, then category-related defaults."""
+    rows = [dict(r) for r in skills or [] if isinstance(r, dict)]
+    buckets = [[i for i in normalize_skill_list(str(r.get("skills") or "")).split(", ") if i] for r in rows]
+    listed = {i.lower() for b in buckets for i in b}
+
+    def _add(items: list[str], item: str) -> None:
+        label = professional_skill_label(item)
+        key = label.lower()
+        if key in listed or not label:
+            return
+        items.append(label)
+        listed.add(key)
+
+    for row, items in zip(rows, buckets):
+        cat = str(row.get("category") or "")
+        if len(items) >= minimum:
+            row["skills"] = ", ".join(professional_skill_label(i) for i in items)
+            continue
+        for item in candidates:
+            if len(items) >= minimum:
+                break
+            if cat in _LEXICON and _lexicon_home(item, [cat]):
+                _add(items, item)
+        if allow_related_pad:
+            for item in _CATEGORY_PAD.get(cat, ()):
+                if len(items) >= minimum:
+                    break
+                _add(items, item)
+        row["skills"] = ", ".join(items)
+    return rows
+
+
+def rehome_misplaced_skills(skills: list[dict]) -> list[dict]:
+    """Move an item the lexicon places elsewhere ("Node.js" under Languages) into that category.
+
+    Only moves into a category the section already has, and only when the item does not
+    also belong where it is (DynamoDB stays under Databases or Cloud).
+    """
+    rows = [dict(r) for r in skills or [] if isinstance(r, dict)]
+    names = [str(r.get("category") or "") for r in rows]
+    known = [n for n in names if n in _LEXICON]
+    buckets = [[i for i in normalize_skill_list(str(r.get("skills") or "")).split(", ") if i] for r in rows]
+    moves: dict[int, list[str]] = {}
+    for idx, (name, items) in enumerate(zip(names, buckets)):
+        if name not in _LEXICON:
+            continue
+        keep: list[str] = []
+        for item in items:
+            others = [n for n in known if n != name]
+            home = None if _lexicon_home(item, [name]) else _lexicon_home(item, others)
+            if home:
+                moves.setdefault(names.index(home), []).append(item)
+            else:
+                keep.append(item)
+        buckets[idx] = keep
+    for idx, items in moves.items():
+        buckets[idx] = buckets[idx] + [i for i in items if i not in buckets[idx]]
+    return [{**r, "skills": ", ".join(b)} for r, b in zip(rows, buckets) if b]
+
+
+def _split_compound(parts: list[str], items: list[str]) -> list[tuple[str, list[str]]]:
+    """Distribute *items* across *parts* by lexicon; unmatched items stay with the first part."""
+    buckets: dict[str, list[str]] = {p: [] for p in parts}
+    for item in items:
+        home = _lexicon_home(item, parts) or parts[0]
+        buckets[home].append(item)
+    return [(p, buckets[p]) for p in parts if buckets[p]]
+
+
+def normalize_skill_categories(skills: list[dict]) -> list[dict]:
+    """Canonical names, compound categories split, duplicates merged, each technology once."""
+    merged: dict[str, list[str]] = {}
+    order: list[str] = []
+    seen_items: set[str] = set()
+    pending_generic: list[str] = []
+
+    def _put(cat: str, items: list[str]) -> None:
+        key = cat.lower()
+        if key not in merged:
+            merged[key] = []
+            order.append(cat)
+        merged[key].extend(items)
+
+    for row in skills or []:
+        if not isinstance(row, dict):
+            continue
+        parts = category_parts(str(row.get("category") or ""))
+        items = [i for i in normalize_skill_list(str(row.get("skills") or "")).split(", ") if i]
+        fresh = []
+        for item in items:
+            key = item.lower()
+            if key in seen_items:
+                continue
+            seen_items.add(key)
+            fresh.append(item)
+        if not fresh:
+            continue
+        if not parts or parts[0].lower() in _GENERIC_NAMES:
+            pending_generic.extend(fresh)
+            continue
+        if len(parts) == 1:
+            _put(parts[0], fresh)
+            continue
+        for cat, bucket in _split_compound(parts, fresh):
+            _put(cat, bucket)
+    out = [{"category": cat, "skills": ", ".join(merged[cat.lower()])} for cat in order]
+    if pending_generic:
+        key = "tools"
+        if key in merged:
+            merged[key].extend(pending_generic)
+            out = [{"category": cat, "skills": ", ".join(merged[cat.lower()])} for cat in order]
+        else:
+            out.append({"category": "Tools", "skills": ", ".join(pending_generic)})
+    return out
+
+
+# Words that read as noise when bold, whatever their case ("**Key** results").
+_COMMON_WORDS = frozenset(
+    """
+    key data team teams project projects work level mode lab tests test testing development stack
+    system systems platform platforms service services policy policies security quality analytics
+    automation engineering engineer product products process processes support customer customers
+    business users user performance reliability scale scalable design delivery features feature
+    tools tooling solutions application applications code reporting report reports operations
+    infrastructure integration integrations documentation monitoring workflows workflow pipeline
+    pipelines model models modeling api apis web mobile backend frontend cloud devices device
+    management strategy requirements standards experience new improved high low end real time
+    """.split()
+)
+
+
+def is_strong_emphasis_term(term: str) -> bool:
+    """A term worth bolding: a named technology or a figure, not a common word.
+
+    "Kafka", "AWS", "Node.js", "40%" and "Security Hub" qualify; "key", "data" and
+    "Testing" do not.
+    """
+    t = strip_bold_markers(term).strip()
+    if len(t) < 2 or t.lower() in _COMMON_WORDS:
+        return False
+    tokens = t.split()
+    for tok in tokens:
+        if tok.lower() in _COMMON_WORDS:
+            continue
+        if any(ch.isdigit() for ch in tok) or any(ch in ".+#/%$" for ch in tok):
+            return True
+        if any(ch.isupper() for ch in tok):
+            return True
+    return False
+
+
+def cap_bold_spans(text: str, max_spans: int) -> str:
+    """Unwrap low-value ``**bold**`` spans, then keep the first *max_spans* of the rest."""
+    if not text or "**" not in text:
+        return text or ""
+    text = _ADJACENT_BOLD_RE.sub(r"**\1\2\3**", text)
+    count = 0
+
+    def _keep(m: re.Match[str]) -> str:
+        nonlocal count
+        if not is_strong_emphasis_term(m.group(1)):
+            return m.group(1)
+        count += 1
+        return m.group(0) if count <= max_spans else m.group(1)
+
+    out = _BOLD_SPAN_RE.sub(_keep, text)
+    # A dangling unmatched "**" would render literally; drop it.
+    if out.count("**") % 2 == 1:
+        idx = out.rfind("**")
+        out = out[:idx] + out[idx + 2:]
+    return out
+
+
+MAX_BOLD_PER_BULLET = 2
+MAX_BOLD_IN_SUMMARY = 4
+MAX_BOLD_IN_DESCRIPTION = 2
+
+
+def normalize_tailored_formatting(resume: dict | None) -> dict | None:
+    """Apply the formatting contract to a parsed tailored resume (returns a copy)."""
+    if not resume or not isinstance(resume, dict):
+        return resume
+    out = dict(resume)
+    if isinstance(out.get("profile_summary"), str):
+        out["profile_summary"] = cap_bold_spans(out["profile_summary"], MAX_BOLD_IN_SUMMARY)
+    if isinstance(out.get("technical_skills"), list):
+        out["technical_skills"] = normalize_skill_categories(out["technical_skills"])
+    exp_out: list[dict] = []
+    for entry in out.get("work_experience") or []:
+        if not isinstance(entry, dict):
+            continue
+        row = dict(entry)
+        if isinstance(row.get("used_skills"), str):
+            row["used_skills"] = normalize_skill_list(row["used_skills"]) or None
+        if isinstance(row.get("project_description"), str):
+            row["project_description"] = cap_bold_spans(row["project_description"], MAX_BOLD_IN_DESCRIPTION)
+        row["bullets"] = [
+            cap_bold_spans(b, MAX_BOLD_PER_BULLET)
+            for b in (row.get("bullets") or [])
+            if isinstance(b, str) and b.strip()
+        ]
+        exp_out.append(row)
+    if "work_experience" in out:
+        out["work_experience"] = exp_out
+    return out

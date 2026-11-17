@@ -1,0 +1,68 @@
+{
+  "manifest_version": 3,
+  "name": "NAO",
+  "version": "2.4.2",
+  "description": "Apply faster with NAO: tailored resumes, application autofill, and an assistant that knows each job.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAt0ON3WuqLhSQrnqtIytemjIu2bpyd5cCONAeyizYe0nFhKCfRySwXlwLWOsyMo8btFyHEloymbInWDlJ3csRoWEPC6OYQefKjreB3QNCMPjjIGjiwbv8EmM1qZ4F03VD9EzGIYghr9E35oOY7NkFvb4oj6fb8Gde9J4cVZSwbVofHe0UoSARHxUVEMTaoIDabTAVW5oD/sCBfQZZaUtXvDyZZgPF2eqI4H0ZBuSgEVknAKftdECG69eC0zGZl3SVMYn6t7+frwXuFgoRWc90OEdz09dvRxXCNWmcKEdeksnJRpfUMCH0cvRmw4i3QjVRyJjqGWMncGGY1oVBny9CewIDAQAB",
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "tabs",
+    "scripting",
+    "webNavigation",
+    "cookies",
+    "alarms",
+    "webRequest"
+  ],
+  "optional_host_permissions": ["*://*/*", "https://*.greenhouse.io/*"],
+  "host_permissions": [
+    "https://nao.it.com/*",
+    "https://www.nao.it.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://localhost/*",
+    "https://*.jobright.ai/*",
+    "https://jobright.ai/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://nao.it.com/*",
+        "https://www.nao.it.com/*",
+        "http://localhost/*",
+        "http://127.0.0.1/*",
+        "https://localhost/*"
+      ],
+      "js": ["content/webapp-bridge.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "Open NAO Assistant",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["installed.svg"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

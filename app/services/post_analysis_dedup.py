@@ -1,0 +1,660 @@
+"""Layer 2 post-analysis deduplication engine.
+
+After OpenAI analysis returns a match score for a job, this module decides
+whether the job should be saved as active, marked as duplicated, or skipped
+entirely based on same-company comparisons within the user's recycle window.
+
+Rules (applied in order):
+  0a. Security clearance / not-a-job → duplicated (removed from Jobs list).
+  0b. Score 0 or below user's min threshold → duplicated (below_min_score).
+  1. Same URL - another active job with identical normalized_url → duplicated (same_url).
+  2. Strict similarity - same title + same company → duplicated.
+  3. Applied at same company - user already applied within recycle window → duplicated
+     (per-user effective preference; platform default fallback).
+  4. Score comparison - keep the higher-scoring job active; mark the other duplicated
+     (per-user effective preference; platform default fallback).
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone, timedelta
+
+from sqlalchemy import and_, func, or_, select
+
+from app.models.database import Job, JobMatchResult, ValidJobUserApplication, UserJobStatus
+from app.services.job_exclusion_types import (
+    APPLIED_COMPANY_EXCLUSION,
+    BELOW_MIN_SCORE_EXCLUSION,
+    LOWER_SCORE_EXCLUSION,
+    NOT_A_JOB_POSTING_EXCLUSION,
+    SAME_URL_EXCLUSION,
+    SECURITY_CLEARANCE_EXCLUSION,
+    STRICT_SIMILARITY_EXCLUSION,
+    SUPERSEDED_BY_HIGHER_EXCLUSION,
+)
+from app.storage.repository import JobMatchRepository, UserJobStatusRepository
+from app.storage.database import get_session
+from app.api.websocket import publish_ws_event
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+_PLACEHOLDER_COMPANIES = frozenset({
+    "unknown", "n/a", "na", "none", "tbd", "not specified",
+    "confidential", "company", "employer", "hiring company",
+})
+
+_EMPLOYER_SLUG_FROM_URL = re.compile(
+    r"welcometothejungle\.com/(?:[a-z]{2}/)?companies/([^/?#]+)/",
+    re.IGNORECASE,
+)
+
+_TITLE_STRIP_RE = re.compile(r"[^\w\s]")
+
+
+_COMPANY_NOISE_WORDS = frozenset(
+    {"inc", "llc", "corp", "ltd", "co", "corporation", "limited", "the"}
+)
+
+
+def _first_company_token(company: str) -> str:
+    tokens = [t for t in re.findall(r"\w+", company.lower()) if t not in _COMPANY_NOISE_WORDS]
+    return tokens[0] if tokens else ""
+
+
+def normalize_company(company: str | None) -> str:
+    if not company:
+        return ""
+    normalized = " ".join(company.strip().lower().split())
+    normalized = re.sub(
+        r"\b(inc\.?|llc|corp\.?|ltd\.?|co\.?|corporation|limited)\b",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"[^\w\s]", "", normalized)
+    normalized = " ".join(normalized.split())
+    if normalized in _PLACEHOLDER_COMPANIES:
+        return ""
+    return normalized
+
+
+def employer_slug_from_url(url: str | None) -> str:
+    """Stable employer id from job board URL (e.g. ``plus-que-pro`` on WTTJ)."""
+    if not url:
+        return ""
+    match = _EMPLOYER_SLUG_FROM_URL.search(url.strip())
+    return match.group(1).lower() if match else ""
+
+
+def resolve_employer_key(job: Job, *, company_name: str | None = None) -> str:
+    """Canonical grouping key for same-employer dedup.
+
+    Prefer URL org slug (stable across LLM rewrites), then normalized company name.
+    """
+    slug = employer_slug_from_url(job.source_url)
+    if slug:
+        return f"slug:{slug}"
+
+    meta = job.raw_metadata if isinstance(job.raw_metadata, dict) else {}
+    for candidate in (company_name, job.company, meta.get("scraped_company_name")):
+        normalized = normalize_company(candidate if isinstance(candidate, str) else None)
+        if normalized:
+            return f"name:{normalized}"
+    return ""
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _effective_date(job: Job) -> datetime:
+    if job.posted_date:
+        d = job.posted_date
+        if d.tzinfo is not None:
+            d = d.replace(tzinfo=None)
+        return d
+    return job.created_at.replace(tzinfo=None) if job.created_at.tzinfo else job.created_at
+
+
+def _within_recycle_window(job: Job, recycle_days: int) -> bool:
+    """True when the job falls inside the dedup comparison window."""
+    cutoff = _utcnow() - timedelta(days=recycle_days)
+    return _effective_date(job) >= cutoff
+
+
+def _normalize_title(title: str | None) -> str:
+    """Lowercase, strip whitespace, remove punctuation for comparison."""
+    if not title:
+        return ""
+    lowered = title.strip().lower()
+    if lowered in {"none", "null", "unknown", "unknown position", "n/a", "na", "untitled", "untitled job"}:
+        return ""
+    return _TITLE_STRIP_RE.sub("", lowered).strip()
+
+
+async def _find_same_url_active_duplicate(
+    session,
+    *,
+    user_id: str,
+    job_id: str,
+    normalized_url: str | None,
+) -> Job | None:
+    url = (normalized_url or "").strip()
+    if not url:
+        return None
+    result = await session.execute(
+        select(Job)
+        .join(
+            UserJobStatus,
+            and_(
+                UserJobStatus.job_id == Job.id,
+                UserJobStatus.user_id == user_id,
+                UserJobStatus.status == "active",
+            ),
+        )
+        .where(
+            Job.status == "active",
+            Job.normalized_url == url,
+            Job.id != job_id,
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _list_active_peer_jobs(
+    session,
+    *,
+    user_id: str,
+    job_id: str,
+    employer_key: str,
+    recycle_days: int,
+    company_name: str | None = None,
+    domain: str | None = None,
+) -> list[Job]:
+    """Active jobs for this user at the same employer within the recycle window.
+
+    Uses SQL-level company/domain pre-filtering so the database returns only
+    plausible candidates instead of every active job for the user.
+    """
+    if not employer_key:
+        return []
+
+    cutoff = _utcnow() - timedelta(days=recycle_days)
+
+    stmt = (
+        select(Job)
+        .join(
+            UserJobStatus,
+            and_(
+                UserJobStatus.job_id == Job.id,
+                UserJobStatus.user_id == user_id,
+                UserJobStatus.status == "active",
+            ),
+        )
+        .where(
+            Job.status == "active",
+            Job.id != job_id,
+            func.coalesce(Job.posted_date, Job.created_at) >= cutoff,
+        )
+    )
+
+    # The SQL prefilter must be looser than resolve_employer_key ("Acme Inc"
+    # and "acme" share a key; slug keys ignore the company text), otherwise
+    # real peers are dropped before the exact Python check below.
+    candidates = []
+    kind, _, key_value = employer_key.partition(":")
+    if kind == "slug":
+        candidates.append(func.lower(Job.source_url).contains(key_value, autoescape=True))
+    name_sources = [company_name or "", key_value if kind == "name" else ""]
+    for token in {_first_company_token(source) for source in name_sources} - {""}:
+        candidates.append(func.lower(Job.company).contains(token, autoescape=True))
+    if candidates:
+        stmt = stmt.where(or_(*candidates))
+    elif domain:
+        stmt = stmt.where(Job.domain == domain)
+
+    result = await session.execute(stmt)
+    return [
+        job
+        for job in result.scalars().all()
+        if resolve_employer_key(job) == employer_key
+    ]
+
+
+async def _apply_inbox_applications(
+    session,
+    *,
+    current_job: Job,
+    user_id: str,
+    match_data: dict,
+    overall_score: int,
+    recycle_days: int,
+    applied_company_enabled: bool,
+) -> dict | None:
+    """Confirmation emails at this company: same role marks the job applied,
+    another role hides it when the applied-company rule is on. Returns the
+    duplicated result when hidden, else None.
+    """
+    from app.services import mail_applications
+
+    now = _utcnow()
+    recycle_cutoff = now - timedelta(days=recycle_days)
+    same_role, newest = await mail_applications.find_for_job(
+        session,
+        user_id,
+        current_job,
+        since=min(recycle_cutoff, now - mail_applications.LINK_LOOKBACK),
+    )
+    if same_role is not None:
+        await mail_applications.mark_job_from_email(session, user_id, current_job, same_role)
+        logger.info("post_analysis_dedup_applied_from_email", job_id=current_job.id, user_id=user_id)
+        return None
+    if applied_company_enabled and newest is not None and newest.applied_at >= recycle_cutoff:
+        logger.info("post_analysis_dedup_applied_company_email", job_id=current_job.id, user_id=user_id)
+        return await _save_duplicated(
+            session,
+            job_id=current_job.id,
+            user_id=user_id,
+            match_data=match_data,
+            overall_score=overall_score,
+            duplicated_because_id=newest.job_id,
+            exclusion_type=APPLIED_COMPANY_EXCLUSION,
+            reason=mail_applications.dedup_reason(newest),
+        )
+    return None
+
+
+async def run_post_analysis_dedup(
+    job_id: str,
+    user_id: str,
+    match_data: dict,
+    extraction_id: str | None,
+    recycle_days: int | None = None,
+    min_match_score: int | None = None,
+) -> dict:
+    """Returns {"action": "saved_active"|"saved_duplicated"|"skipped", ...}"""
+
+    try:
+        overall_score = int(match_data.get("overall_score", 0) or 0)
+    except (TypeError, ValueError):
+        overall_score = 0
+
+    async with get_session() as session:
+        from app.storage.user_repository import UserRepository
+
+        user_repo = UserRepository(session)
+        if recycle_days is None:
+            recycle_days = await user_repo.get_dedup_recycle_days(user_id)
+        if min_match_score is None:
+            min_match_score = await user_repo.get_effective_min_match_score(user_id)
+        applied_company_enabled = await user_repo.get_effective_dedup_applied_company_enabled(
+            user_id
+        )
+        score_comparison_enabled = await user_repo.get_effective_dedup_score_comparison_enabled(
+            user_id
+        )
+        row = await session.execute(select(Job).where(Job.id == job_id))
+        current_job = row.scalar_one_or_none()
+        if not current_job:
+            logger.warning("post_analysis_dedup_job_not_found", job_id=job_id)
+            return {"action": "skipped", "reason": "job_not_found"}
+
+        from app.services.quick_apply import is_quick_apply_for
+
+        if is_quick_apply_for(current_job.raw_metadata, user_id):
+            result = await _save_active(session, job_id, user_id, match_data, overall_score)
+            result["quick_apply"] = True
+            return result
+
+        if match_data.get("requires_security_clearance"):
+            logger.info(
+                "post_analysis_dedup_security_clearance",
+                job_id=job_id,
+                user_id=user_id,
+            )
+            return await _save_duplicated(
+                session,
+                job_id=job_id,
+                user_id=user_id,
+                match_data=match_data,
+                overall_score=overall_score,
+                duplicated_because_id=None,
+                exclusion_type=SECURITY_CLEARANCE_EXCLUSION,
+                reason="Requires security clearance, removed after analysis.",
+            )
+
+        if match_data.get("is_job_posting") is False:
+            logger.info(
+                "post_analysis_dedup_not_a_job_posting",
+                job_id=job_id,
+                user_id=user_id,
+            )
+            return await _save_duplicated(
+                session,
+                job_id=job_id,
+                user_id=user_id,
+                match_data=match_data,
+                overall_score=overall_score,
+                duplicated_because_id=None,
+                exclusion_type=NOT_A_JOB_POSTING_EXCLUSION,
+                reason="Not a job posting, removed after analysis.",
+            )
+
+        # Score 0 ("0 Weak") must leave the Jobs list after Phase A. Also honor
+        # the user's configured minimum when it is > 0.
+        if overall_score <= 0 or (
+            min_match_score is not None
+            and min_match_score > 0
+            and overall_score < min_match_score
+        ):
+            reason = (
+                "Match score is 0 (Weak), removed after analysis."
+                if overall_score <= 0
+                else (
+                    f"Match score {overall_score}% is below your minimum threshold "
+                    f"({min_match_score}%)."
+                )
+            )
+            logger.info(
+                "post_analysis_dedup_below_min_score",
+                job_id=job_id,
+                user_id=user_id,
+                score=overall_score,
+                min_score=min_match_score,
+            )
+            return await _save_duplicated(
+                session,
+                job_id=job_id,
+                user_id=user_id,
+                match_data=match_data,
+                overall_score=overall_score,
+                duplicated_because_id=None,
+                exclusion_type=BELOW_MIN_SCORE_EXCLUSION,
+                reason=reason,
+            )
+
+        url_duplicate = await _find_same_url_active_duplicate(
+            session,
+            user_id=user_id,
+            job_id=job_id,
+            normalized_url=current_job.normalized_url,
+        )
+        if url_duplicate:
+            logger.info(
+                "post_analysis_dedup_same_url",
+                job_id=job_id,
+                existing_job_id=url_duplicate.id,
+                user_id=user_id,
+            )
+            return await _save_duplicated(
+                session,
+                job_id=job_id,
+                user_id=user_id,
+                match_data=match_data,
+                overall_score=overall_score,
+                duplicated_because_id=url_duplicate.id,
+                exclusion_type=SAME_URL_EXCLUSION,
+                reason="Same job URL already exists in your active list.",
+            )
+
+        hidden = await _apply_inbox_applications(
+            session,
+            current_job=current_job,
+            user_id=user_id,
+            match_data=match_data,
+            overall_score=overall_score,
+            recycle_days=recycle_days,
+            applied_company_enabled=applied_company_enabled,
+        )
+        if hidden is not None:
+            return hidden
+
+        employer_key = resolve_employer_key(current_job)
+        if not employer_key:
+            return await _save_active(session, job_id, user_id, match_data, overall_score)
+
+        same_company_jobs = await _list_active_peer_jobs(
+            session,
+            user_id=user_id,
+            job_id=job_id,
+            employer_key=employer_key,
+            recycle_days=recycle_days,
+            company_name=current_job.company,
+            domain=current_job.domain,
+        )
+
+        if not same_company_jobs:
+            return await _save_active(session, job_id, user_id, match_data, overall_score)
+
+        pool_ids = [j.id for j in same_company_jobs]
+
+        # Batch peer match scores once (avoids N+1 under the per-user save lock).
+        peer_match_rows = await session.execute(
+            select(JobMatchResult).where(
+                JobMatchResult.user_id == user_id,
+                JobMatchResult.job_id.in_(pool_ids),
+            )
+        )
+        peer_matches_by_job_id = {
+            m.job_id: m for m in peer_match_rows.scalars().all()
+        }
+
+        current_title_norm = _normalize_title(current_job.title)
+        for existing_job in same_company_jobs:
+            existing_title_norm = _normalize_title(existing_job.title)
+            if not (current_title_norm and existing_title_norm and current_title_norm == existing_title_norm):
+                continue
+
+            existing_match = peer_matches_by_job_id.get(existing_job.id)
+            existing_score_str = str(existing_match.overall_score) if existing_match else "n/a"
+            logger.info(
+                "post_analysis_dedup_strict_similarity",
+                job_id=job_id,
+                existing_job_id=existing_job.id,
+                existing_score=existing_score_str,
+                new_score=overall_score,
+            )
+            return await _save_duplicated(
+                session,
+                job_id=job_id,
+                user_id=user_id,
+                match_data=match_data,
+                overall_score=overall_score,
+                duplicated_because_id=existing_job.id,
+                exclusion_type=STRICT_SIMILARITY_EXCLUSION,
+                reason="Same title and company as an existing active posting.",
+            )
+
+        if applied_company_enabled:
+            applied_result = await session.execute(
+                select(ValidJobUserApplication).where(
+                    ValidJobUserApplication.user_id == user_id,
+                    ValidJobUserApplication.job_id.in_(pool_ids),
+                )
+            )
+            applied = list(applied_result.scalars().all())
+            if applied:
+                applied_job_id = applied[0].job_id
+                return await _save_duplicated(
+                    session,
+                    job_id=job_id,
+                    user_id=user_id,
+                    match_data=match_data,
+                    overall_score=overall_score,
+                    duplicated_because_id=applied_job_id,
+                    exclusion_type=APPLIED_COMPANY_EXCLUSION,
+                    reason=(
+                        f"User already applied to another posting at this company "
+                        f"within the {recycle_days}-day recycle window."
+                    ),
+                )
+
+        if not score_comparison_enabled:
+            return await _save_active(session, job_id, user_id, match_data, overall_score)
+
+        # Reuse the peer match batch loaded before the strict-similarity scan.
+        existing_matches = list(peer_matches_by_job_id.values())
+        if not existing_matches:
+            return await _save_active(session, job_id, user_id, match_data, overall_score)
+
+        best_existing = max(existing_matches, key=lambda m: m.overall_score)
+        best_existing_score = best_existing.overall_score
+
+        if overall_score > best_existing_score:
+            result = await _save_active(session, job_id, user_id, match_data, overall_score)
+            ujs_repo = UserJobStatusRepository(session)
+            await ujs_repo.upsert(
+                user_id=user_id,
+                job_id=best_existing.job_id,
+                status="duplicated",
+                exclusion_type=SUPERSEDED_BY_HIGHER_EXCLUSION,
+                duplicated_because_id=job_id,
+                reason=(
+                    f"Superseded by a higher-scoring posting at the same company "
+                    f"({overall_score}% vs {best_existing_score}%)."
+                ),
+                match_score_at_decision=float(best_existing_score),
+            )
+            await publish_ws_event({
+                "type": "job_status_changed",
+                "user_id": user_id,
+                "job_id": best_existing.job_id,
+                "status": "duplicated",
+                "exclusion_type": SUPERSEDED_BY_HIGHER_EXCLUSION,
+            })
+            result["flipped_job_id"] = best_existing.job_id
+            return result
+
+        return await _save_duplicated(
+            session,
+            job_id=job_id,
+            user_id=user_id,
+            match_data=match_data,
+            overall_score=overall_score,
+            duplicated_because_id=best_existing.job_id,
+            exclusion_type=LOWER_SCORE_EXCLUSION,
+            reason=(
+                f"Lower or equal match score ({overall_score}% vs "
+                f"{best_existing_score}%) at the same company."
+            ),
+        )
+
+
+def _provenance_fields(match_data: dict) -> dict:
+    """Engine/version/fingerprint from a match result, for the stored row.
+
+    The LLM path supplies only ``match_engine``; the vector path also carries a
+    scorer version and an input fingerprint, which is what makes its scores
+    re-derivable.
+    """
+    return {
+        "match_engine": match_data.get("match_engine"),
+        "scorer_version": match_data.get("scorer_version"),
+        "model_version": match_data.get("model_version"),
+        "inputs_fingerprint": match_data.get("inputs_fingerprint"),
+    }
+
+
+async def _save_active(
+    session,
+    job_id: str,
+    user_id: str,
+    match_data: dict,
+    overall_score: int,
+) -> dict:
+    """Save match result and set user_job_status to active."""
+    match_repo = JobMatchRepository(session)
+    await match_repo.upsert(
+        job_id=job_id,
+        user_id=user_id,
+        overall_score=overall_score,
+        dimension_scores=match_data.get("dimension_scores", {}),
+        summary=match_data.get("summary", ""),
+        strengths=match_data.get("strengths", []),
+        gaps=match_data.get("gaps", []),
+        recommendation=match_data.get("recommendation", ""),
+        **_provenance_fields(match_data),
+    )
+
+    ujs_repo = UserJobStatusRepository(session)
+    await ujs_repo.upsert(
+        user_id=user_id,
+        job_id=job_id,
+        status="active",
+        match_score_at_decision=float(overall_score),
+    )
+
+    await publish_ws_event({
+        "type": "job_status_changed",
+        "user_id": user_id,
+        "job_id": job_id,
+        "status": "active",
+    })
+
+    logger.info("post_analysis_dedup_saved_active", job_id=job_id, user_id=user_id, score=overall_score)
+    return {"action": "saved_active", "job_id": job_id, "score": overall_score}
+
+
+async def _save_duplicated(
+    session,
+    *,
+    job_id: str,
+    user_id: str,
+    match_data: dict,
+    overall_score: int,
+    duplicated_because_id: str | None,
+    exclusion_type: str,
+    reason: str,
+) -> dict:
+    """Save match result and set user_job_status to duplicated."""
+    match_repo = JobMatchRepository(session)
+    await match_repo.upsert(
+        job_id=job_id,
+        user_id=user_id,
+        overall_score=overall_score,
+        dimension_scores=match_data.get("dimension_scores", {}),
+        summary=match_data.get("summary", ""),
+        strengths=match_data.get("strengths", []),
+        gaps=match_data.get("gaps", []),
+        recommendation=match_data.get("recommendation", ""),
+        **_provenance_fields(match_data),
+    )
+
+    ujs_repo = UserJobStatusRepository(session)
+    await ujs_repo.upsert(
+        user_id=user_id,
+        job_id=job_id,
+        status="duplicated",
+        exclusion_type=exclusion_type,
+        duplicated_because_id=duplicated_because_id,
+        reason=reason,
+        match_score_at_decision=float(overall_score),
+    )
+
+    await publish_ws_event({
+        "type": "job_status_changed",
+        "user_id": user_id,
+        "job_id": job_id,
+        "status": "duplicated",
+        "exclusion_type": exclusion_type,
+    })
+
+    logger.info(
+        "post_analysis_dedup_saved_duplicated",
+        job_id=job_id,
+        user_id=user_id,
+        score=overall_score,
+        exclusion_type=exclusion_type,
+        because_id=duplicated_because_id,
+    )
+    return {
+        "action": "saved_duplicated",
+        "job_id": job_id,
+        "score": overall_score,
+        "exclusion_type": exclusion_type,
+        "duplicated_because_id": duplicated_because_id,
+        "reason": reason,
+    }

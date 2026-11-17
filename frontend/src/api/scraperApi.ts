@@ -1,0 +1,326 @@
+import { apiClient } from './client';
+import type {
+  ScrapedJob,
+  ScrapedJobsPage,
+  ScrapedJobUpdatePayload,
+  ScraperStats,
+  AdminScraperStats,
+  ScrapeRun,
+  SyncStatus,
+  SpiderInfo,
+  SyncPlatform,
+  SyncCheckpoint,
+  SyncTriggerOptions,
+  JobSyncSchedule,
+  JobSyncScheduleUpdate,
+  RerunExtractionResponse,
+  DeleteScrapedJobResponse,
+  DashboardJobsPage,
+} from '../types/scraper';
+
+export async function fetchScrapedJobs(params: {
+  page?: number;
+  per_page?: number;
+  source?: string;
+  q?: string;
+  remote_only?: boolean;
+  sort?: string;
+  order?: string;
+}): Promise<ScrapedJobsPage> {
+  const { data } = await apiClient.get('/scraper/jobs', { params });
+  return data;
+}
+
+export type DashboardView =
+  | 'all'
+  | 'today'
+  | 'mine'
+  | 'suggested'
+  | 'applied'
+  | 'applied_today'
+  | 'available'
+  | 'ready'
+  | 'sheet_posted'
+  | 'pumble_posted'
+  | 'needs_extraction'
+  | 'extracted'
+  | 'extraction_failed'
+  | 'manual';
+
+export async function fetchDashboardJobs(params: {
+  page?: number;
+  per_page?: number;
+  source?: string;
+  q?: string;
+  title?: string;
+  company?: string;
+  /** Comma-separated remote,hybrid,onsite. Empty = any. */
+  work_modes?: string;
+  /** @deprecated Prefer work_modes=remote */
+  remote_only?: boolean;
+  min_match_score?: number;
+  sort?: string;
+  order?: string;
+  view?: DashboardView;
+  timezone?: string;
+}): Promise<DashboardJobsPage> {
+  const { data } = await apiClient.get('/jobs/dashboard', { params });
+  return data;
+}
+
+export interface DashboardCounts {
+  all: number;
+  today: number;
+  mine: number;
+  /** Scored jobs: match score computed, not ready to apply yet, not applied. */
+  available: number;
+  /** @deprecated Prefer `available`. Kept for older API responses. */
+  suggested?: number;
+  /** Jobs marked applied today (user timezone). Optional for older backends. */
+  applied_today?: number;
+}
+
+export async function fetchDashboardCounts(params: {
+  source?: string;
+  q?: string;
+  title?: string;
+  company?: string;
+  work_modes?: string;
+  /** @deprecated Prefer work_modes=remote */
+  remote_only?: boolean;
+  timezone?: string;
+}): Promise<DashboardCounts> {
+  // Match-score filtering is list-only; tab badges stay aligned with Total jobs.
+  const { data } = await apiClient.get('/jobs/dashboard/counts', { params });
+  return {
+    all: data.all ?? 0,
+    today: data.today ?? 0,
+    mine: data.mine ?? 0,
+    available: data.available ?? data.suggested ?? 0,
+    suggested: data.suggested,
+    applied_today: data.applied_today,
+  };
+}
+
+export interface NewJobsCount {
+  count: number;
+  latest_added_at: string | null;
+}
+
+/** Scored jobs that reached the board after ``since`` (sidebar badge). */
+export async function fetchNewJobsCount(since: string): Promise<NewJobsCount> {
+  const { data } = await apiClient.get<NewJobsCount>('/jobs/dashboard/new-count', { params: { since } });
+  return { count: data?.count ?? 0, latest_added_at: data?.latest_added_at ?? null };
+}
+
+export async function fetchScrapedJob(id: string) {
+  const { data } = await apiClient.get(`/scraper/jobs/${id}`);
+  return data;
+}
+
+/** `memberId` reads a member of a team space the caller leads. */
+export async function fetchScraperStats(memberId?: string): Promise<ScraperStats> {
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const { data } = await apiClient.get('/scraper/stats', {
+    params: memberId ? { timezone, member_id: memberId } : { timezone },
+  });
+  return data;
+}
+
+export interface WeeklyProgress {
+  timezone: string;
+  days: number;
+  min_match_score: number;
+  series: Array<{ date: string; label: string; posted: number; recommended: number; applied: number }>;
+  totals: { posted: number; recommended: number; applied: number };
+}
+
+/** Daily new / above-minimum / applied counts for the last ``days`` local days. */
+export async function fetchWeeklyProgress(days: number, memberId?: string): Promise<WeeklyProgress> {
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const { data } = await apiClient.get('/jobs/dashboard/weekly-progress', {
+    params: memberId ? { timezone, days, member_id: memberId } : { timezone, days },
+  });
+  return data;
+}
+
+export async function fetchAdminScraperStats(): Promise<AdminScraperStats> {
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const { data } = await apiClient.get('/scraper/stats/admin', { params: { timezone } });
+  return data;
+}
+
+export async function fetchSources(): Promise<string[]> {
+  const { data } = await apiClient.get('/scraper/sources');
+  return data;
+}
+
+export async function fetchScrapeRuns(limit = 20): Promise<ScrapeRun[]> {
+  const { data } = await apiClient.get('/scraper/runs', { params: { limit } });
+  return data;
+}
+
+export async function triggerSync(
+  spiderNameOrOptions: string | SyncTriggerOptions = 'all',
+): Promise<SyncStatus> {
+  const body: SyncTriggerOptions =
+    typeof spiderNameOrOptions === 'string'
+      ? { spider_name: spiderNameOrOptions, sync_mode: 'incremental' }
+      : {
+          spider_name: spiderNameOrOptions.spider_name ?? 'all',
+          sync_mode: spiderNameOrOptions.sync_mode ?? 'incremental',
+          spider_names: spiderNameOrOptions.spider_names,
+          posted_since: spiderNameOrOptions.posted_since,
+          posted_until: spiderNameOrOptions.posted_until,
+        };
+  const { data } = await apiClient.post('/scraper/sync', body);
+  return data;
+}
+
+export async function fetchSyncPlatforms(): Promise<SyncPlatform[]> {
+  const { data } = await apiClient.get('/scraper/sync/platforms');
+  return data;
+}
+
+export async function fetchSyncCheckpoints(): Promise<SyncCheckpoint[]> {
+  const { data } = await apiClient.get('/scraper/sync/checkpoints');
+  return data;
+}
+
+export async function fetchJobSyncSchedule(): Promise<JobSyncSchedule> {
+  const { data } = await apiClient.get('/scraper/sync/schedule');
+  return data;
+}
+
+export async function saveJobSyncSchedule(
+  payload: JobSyncScheduleUpdate,
+): Promise<JobSyncSchedule> {
+  const { data } = await apiClient.put('/scraper/sync/schedule', payload);
+  return data;
+}
+
+export interface StopFetchResponse {
+  status: string;
+  message: string;
+  interrupted_count: number;
+  interrupted_run_ids: string[];
+  schedule_disabled: boolean;
+  stop_requested: boolean;
+}
+
+export async function stopJobFetch(): Promise<StopFetchResponse> {
+  const { data } = await apiClient.post('/scraper/sync/stop');
+  return data;
+}
+
+export async function fetchSyncStatus(): Promise<SyncStatus> {
+  const { data } = await apiClient.get('/scraper/sync/status');
+  return data;
+}
+
+export async function fetchSpiders(): Promise<SpiderInfo[]> {
+  const { data } = await apiClient.get('/scraper/spiders');
+  return data;
+}
+
+export interface AuthPlatformStatus {
+  platform: string;
+  label: string;
+  exists: boolean;
+  corrupt: boolean;
+  saved_at: string | null;
+  cookie_count: number;
+  setup_command: string;
+}
+
+export async function fetchAuthStatus(): Promise<AuthPlatformStatus[]> {
+  const { data } = await apiClient.get('/scraper/auth/status');
+  return data;
+}
+
+export async function clearAuthSession(platform: string): Promise<{ status: string; message: string }> {
+  const { data } = await apiClient.post(`/scraper/auth/clear/${platform}`);
+  return data;
+}
+
+export async function rerunScrapedJob(jobId: string): Promise<RerunExtractionResponse> {
+  const { data } = await apiClient.post(`/scraper/jobs/${jobId}/rerun-extraction`);
+  return data;
+}
+
+export async function updateScrapedJob(
+  jobId: string,
+  payload: ScrapedJobUpdatePayload,
+): Promise<ScrapedJob> {
+  const { data } = await apiClient.patch(`/scraper/jobs/${jobId}`, payload);
+  return data;
+}
+
+export async function deleteScrapedJob(jobId: string): Promise<DeleteScrapedJobResponse> {
+  const { data } = await apiClient.delete(`/scraper/jobs/${jobId}`);
+  return data;
+}
+
+export interface ManualJdResponse {
+  job_id: string;
+  extraction_id: string;
+  extraction_status: string;
+  raw_plain_text: string;
+}
+
+/** Admin: paste JD for extraction-failed / empty jobs; marks extraction completed. */
+export async function saveManualJobDescription(
+  jobId: string,
+  plainText: string,
+): Promise<ManualJdResponse> {
+  const { data } = await apiClient.put<ManualJdResponse>(`/jobs/valid/${jobId}/manual-jd`, {
+    plain_text: plainText,
+  });
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// AI search
+// ---------------------------------------------------------------------------
+
+export interface ScraperAiSearchResponse {
+  matching_jobs: Record<string, unknown>[];
+  query: {
+    rationale?: string | null;
+    sort_by?: string;
+    sort_order?: string;
+    [key: string]: unknown;
+  };
+  total_matching: number;
+}
+
+export async function scraperAiSearch(prompt: string): Promise<ScraperAiSearchResponse> {
+  const { data } = await apiClient.post<ScraperAiSearchResponse>('/jobs/valid/ai-search', {
+    prompt,
+  });
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Batch operations
+// ---------------------------------------------------------------------------
+
+export interface BatchOperationResponse {
+  succeeded: string[];
+  failed: string[];
+  message: string;
+}
+
+export async function batchDeleteScrapedJobs(jobIds: string[]): Promise<BatchOperationResponse> {
+  const { data } = await apiClient.post<BatchOperationResponse>('/scraper/jobs/batch-delete', {
+    job_ids: jobIds,
+  });
+  return data;
+}
+
+export async function batchRerunScrapedJobs(jobIds: string[]): Promise<BatchOperationResponse> {
+  const { data } = await apiClient.post<BatchOperationResponse>('/scraper/jobs/batch-rerun', {
+    job_ids: jobIds,
+  });
+  return data;
+}

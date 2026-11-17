@@ -1,0 +1,71 @@
+# Laptop overlay (16 GB RAM, Docker Desktop capped at ~2 GB) for the WSL2 stack.
+# The VPS flags in docker-compose.yml (shared_buffers=6GB, Redis 2gb) thrash a laptop.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.laptop.yml --profile docker-db up -d redis postgres
+#
+# scripts/wsl-stack.sh runs this for you. `command` lists REPLACE the base file's
+# lists (Compose does not merge them), so every flag is restated here. Ports are
+# inherited from the base file (loopback only) and must not be redeclared.
+#
+# Connection budget: each worker sizes its pool to its own max_jobs (cap 10 + 2
+# overflow, see run_worker._worker_pool); the API uses DATABASE_POOL_SIZE. The
+# fleet peaks around 75 plus Scrapy subprocesses, inside max_connections=150.
+services:
+  redis:
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - "512mb"
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - "60"
+      - "1000"
+    mem_limit: 768m
+
+  postgres:
+    command:
+      - postgres
+      - -c
+      - max_connections=150
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - jit=off
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=top
+      - -c
+      - idle_in_transaction_session_timeout=300s
+      - -c
+      - log_min_duration_statement=500
+      - -c
+      - wal_compression=on
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - max_worker_processes=8
+      - -c
+      - max_parallel_workers=4
+      - -c
+      - max_parallel_workers_per_gather=2
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+    # Parallel query workers use POSIX shm; Docker's 64 MB default is too small.
+    shm_size: 256mb
+    mem_limit: 1536m

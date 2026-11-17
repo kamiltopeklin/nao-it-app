@@ -1,0 +1,1931 @@
+import { useMemo } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
+import type {
+  CertificatesStyle,
+  EducationStyle,
+  ExperienceStyle,
+  ResumeDesign,
+  SectionId,
+  SkillsStyle,
+  SummaryStyle,
+} from '../../types/resumeDesign';
+import {
+  DEFAULT_CERTIFICATES_STYLE,
+  DEFAULT_EDUCATION_STYLE,
+  DEFAULT_EXPERIENCE_STYLE,
+  DEFAULT_SKILLS_STYLE,
+  DEFAULT_SUMMARY_STYLE,
+  PHOTO_SIZE_PT,
+  dateStyleOf,
+  effectiveHeadingStyle,
+  headerPadSides,
+  isExtraSectionId,
+  marginSides,
+  sectionTitle,
+} from '../../types/resumeDesign';
+import type { ExtraItem, ExtraSection } from '../../types/resumeDesign';
+import type {
+  CertificateBlock,
+  EducationBlock,
+  TechnicalSkillBlock,
+  UserProfile,
+  WorkExperienceBlock,
+} from '../../types/profile';
+import { renderRich } from '../../utils/richText';
+import { deriveWorkContent } from '../../utils/workExperience';
+import { formatFlexibleDate, formatFlexiblePeriod } from '../../utils/flexibleDate';
+import { formatResumeHeaderLocation } from '../../utils/resumeLocation';
+
+export const PT_TO_PX = 1.3333;
+
+/** Matches the .docx photo cell's left margin (`_PHOTO_GAP_PT`). */
+const PHOTO_GAP_PT = 14;
+/** Word's default roundRect corner is 1/6 of the shorter side. */
+const PHOTO_RADIUS: Record<string, string> = { circle: '50%', rounded: '16.67%', square: '0' };
+
+/** Maps a designed font family to the bundled face that is actually rendered (see
+ *  `styles/resumeFonts.css`). The studio and the server-side PDF renderer load the
+ *  same files, so glyph metrics, line wraps and page breaks are identical. Every face
+ *  except EB Garamond is metric-compatible with the original, so the .docx keeps the
+ *  original family name without reflowing. */
+export const RESUME_FONT_RENDER: Record<string, string> = {
+  Calibri: 'NAO Carlito',
+  Carlito: 'NAO Carlito',
+  Arial: 'NAO Liberation Sans',
+  Helvetica: 'NAO Liberation Sans',
+  'Times New Roman': 'NAO Liberation Serif',
+  Cambria: 'NAO Caladea',
+  Georgia: 'NAO Gelasio',
+  Garamond: 'NAO EB Garamond',
+  Inter: 'NAO Inter',
+  Roboto: 'NAO Roboto',
+  'Source Sans 3': 'NAO Source Sans 3',
+  'Open Sans': 'NAO Open Sans',
+  'Source Serif 4': 'NAO Source Serif 4',
+  Lora: 'NAO Lora',
+};
+
+/** A cover letter rendered with the resume's letterhead and summary styling. */
+export interface CoverLetterBody {
+  title?: string;
+  /** Paragraphs in order; a single `\n` inside one is a soft line break. */
+  paragraphs: string[];
+}
+
+interface ResumePreviewProps {
+  design: ResumeDesign;
+  profile: UserProfile | null;
+  /** When true, the vertical page margin is omitted so the paginator can add a
+   *  real top/bottom margin to every page. Horizontal margins stay intact. */
+  paged?: boolean;
+  /** Render a cover letter (letterhead + one titled body) instead of resume sections. */
+  letter?: CoverLetterBody | null;
+}
+
+/** Vertical page margins (top/bottom) in CSS px, shared with the paginator. */
+export function resumeVerticalMarginsPx(design: ResumeDesign): { top: number; bottom: number } {
+  const m = marginSides(design.layout);
+  return { top: m.top * PT_TO_PX, bottom: m.bottom * PT_TO_PX };
+}
+
+/** Whether the header renders as a full-bleed band (no top margin on page 1). */
+export function resumeHasHeaderBand(design: ResumeDesign): boolean {
+  return design.layout.header_background !== 'none';
+}
+
+function asArray<T>(value: unknown): T[] {
+  return Array.isArray(value) ? (value as T[]) : [];
+}
+
+function tint(hex: string, keep: number): string {
+  const v = (hex || '#000000').replace('#', '');
+  const full = v.length === 3 ? v.split('').map((ch) => ch + ch).join('') : v;
+  const r = parseInt(full.slice(0, 2), 16) || 0;
+  const g = parseInt(full.slice(2, 4), 16) || 0;
+  const b = parseInt(full.slice(4, 6), 16) || 0;
+  const mix = (x: number) => Math.round(255 * (1 - keep) + x * keep);
+  const hx = (x: number) => x.toString(16).padStart(2, '0');
+  return `#${hx(mix(r))}${hx(mix(g))}${hx(mix(b))}`;
+}
+
+function period(design: ResumeDesign, start?: string, end?: string): string {
+  return formatFlexiblePeriod(start, end, dateStyleOf(design));
+}
+
+const SERIF_FAMILIES = ['Georgia', 'Cambria', 'Times New Roman', 'Garamond', 'Source Serif 4', 'Lora'];
+
+/** CSS stack for a designed family, rendered with the bundled face the PDF also uses. */
+export function resumeFontStack(family: string): string {
+  const fallback = SERIF_FAMILIES.includes(family) ? 'serif' : 'sans-serif';
+  // Calibri renders with the metric-identical Carlito; the original family stays as a
+  // fallback for the moment before the web font loads.
+  const primary = RESUME_FONT_RENDER[family] ?? family;
+  const secondary = primary !== family ? `, "${family}"` : '';
+  return `"${primary}"${secondary}, ${fallback}`;
+}
+
+// Padding inside filled and boxed headings (pt); same values as the .docx compiler.
+const HEADING_PAD_Y_PT = 2;
+const HEADING_PAD_X_PT = 5;
+const HEADING_BAR_PT = 3;
+const HEADING_BAR_GAP_PT = 6;
+
+/** Section heading look; mirrors `_style_heading_paragraph` and `_heading_run`. */
+export function sectionHeadingStyle(design: ResumeDesign, center?: boolean): CSSProperties {
+  const { typography: t, colors: c, layout: l } = design;
+  const tracking = t.heading_tracking_em ?? (t.uppercase_headings ? 0.04 : 0);
+  const css: CSSProperties = {
+    fontSize: t.base_font_pt * PT_TO_PX * t.heading_scale,
+    color: c.heading,
+    fontWeight: 700,
+    textTransform: t.uppercase_headings ? 'uppercase' : 'none',
+    letterSpacing: tracking ? `${tracking}em` : 0,
+    textAlign: (center ?? l.heading_align === 'center') ? 'center' : 'left',
+    fontFamily: t.heading_font_family ? resumeFontStack(t.heading_font_family) : undefined,
+  };
+  const px = (pt: number) => pt * PT_TO_PX;
+  const box = `${px(HEADING_PAD_Y_PT)}px ${px(HEADING_PAD_X_PT)}px`;
+  switch (effectiveHeadingStyle(l)) {
+    case 'underline':
+      css.borderBottom = `1.5px solid ${c.accent}`;
+      css.paddingBottom = 2;
+      break;
+    case 'overline':
+      css.borderTop = `2px solid ${c.accent}`;
+      css.paddingTop = px(3);
+      break;
+    case 'double':
+      css.borderTop = `1px solid ${c.accent}`;
+      css.borderBottom = `1px solid ${c.accent}`;
+      css.padding = `${px(2)}px 0`;
+      break;
+    case 'left_bar':
+      css.borderLeft = `${px(HEADING_BAR_PT)}px solid ${c.accent}`;
+      css.paddingLeft = px(HEADING_BAR_GAP_PT);
+      break;
+    case 'tint':
+      css.background = tint(c.accent, 0.14);
+      css.padding = box;
+      break;
+    case 'solid':
+      css.background = c.accent;
+      css.color = '#ffffff';
+      css.padding = box;
+      break;
+    case 'boxed':
+      css.border = `${px(0.5)}px solid ${c.accent}`;
+      css.padding = box;
+      break;
+    default:
+      break;
+  }
+  return css;
+}
+
+/**
+ * Title + right-aligned date row that stays inside narrow columns (e.g. 2-col sidebar).
+ *
+ * Root cause of overflow: date used `flex: 0 0 auto` (intrinsic width, never shrinks) while
+ * the title lacked `minWidth: 0`, so long periods like "Jan 2016 - Dec 2019" blew past the
+ * 34% education column into the main column.
+ */
+function TitleDateRow({
+  title,
+  date,
+  right,
+}: {
+  title: ReactNode;
+  date: ReactNode | null;
+  right: boolean;
+}) {
+  if (!right || !date) {
+    return <div style={{ minWidth: 0, maxWidth: '100%' }}>{title}</div>;
+  }
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'baseline',
+        justifyContent: 'space-between',
+        gap: 8,
+        width: '100%',
+        minWidth: 0,
+        maxWidth: '100%',
+      }}
+    >
+      <div style={{ flex: '1 1 auto', minWidth: 0, overflowWrap: 'anywhere', wordBreak: 'break-word' }}>{title}</div>
+      <div
+        style={{
+          flex: '0 1 auto',
+          minWidth: 0,
+          maxWidth: '48%',
+          textAlign: 'right',
+          overflowWrap: 'anywhere',
+          wordBreak: 'break-word',
+        }}
+      >
+        {date}
+      </div>
+    </div>
+  );
+}
+
+function fullName(p: UserProfile | null): string {
+  if (!p) return 'Your Name';
+  const parts = [p.name_first, p.name_middle, p.name_last].map((x) => (x || '').trim()).filter(Boolean);
+  if (parts.length) return parts.join(' ');
+  return p.name || 'Your Name';
+}
+
+type ContactKind = 'email' | 'phone' | 'location' | 'linkedin' | 'github';
+
+type ContactItem = { kind: ContactKind; text: string; href?: string };
+
+function cleanUrl(u: string): string {
+  return (u || '').trim().replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/+$/, '');
+}
+
+function ensureHttpUrl(u: string): string {
+  const v = (u || '').trim();
+  if (!v) return '';
+  if (/^https?:\/\//i.test(v)) return v;
+  return `https://${v.replace(/^\/+/, '')}`;
+}
+
+function contactItems(p: UserProfile | null): ContactItem[] {
+  if (!p) return [{ kind: 'email', text: 'you@email.com', href: 'mailto:you@email.com' }];
+  const phone = [p.phone_country_code, p.phone_number].map((x) => (x || '').trim()).filter(Boolean).join(' ');
+  const items: ContactItem[] = [];
+  if ((p.email || '').trim()) {
+    const email = p.email!.trim();
+    items.push({ kind: 'email', text: email, href: `mailto:${email}` });
+  }
+  if (phone) {
+    const tel = phone.replace(/[^\d+]/g, '');
+    items.push({ kind: 'phone', text: phone, href: tel ? `tel:${tel}` : undefined });
+  }
+  const location = formatResumeHeaderLocation(p.address);
+  if (location) {
+    items.push({ kind: 'location', text: location });
+  }
+  if ((p.linkedin_url || '').trim()) {
+    const raw = p.linkedin_url!.trim();
+    items.push({ kind: 'linkedin', text: cleanUrl(raw), href: ensureHttpUrl(raw) });
+  }
+  if ((p.github_url || '').trim()) {
+    const raw = p.github_url!.trim();
+    items.push({ kind: 'github', text: cleanUrl(raw), href: ensureHttpUrl(raw) });
+  }
+  return items;
+}
+
+function ContactText({ item }: { item: ContactItem }) {
+  if (!item.href) return <span>{item.text}</span>;
+  return (
+    <a
+      href={item.href}
+      target={item.href.startsWith('http') ? '_blank' : undefined}
+      rel={item.href.startsWith('http') ? 'noopener noreferrer' : undefined}
+      style={{ color: 'inherit', textDecoration: 'none' }}
+    >
+      {item.text}
+    </a>
+  );
+}
+
+const LINKEDIN_PATH =
+  'M20.45 20.45h-3.56v-5.57c0-1.33-.02-3.04-1.85-3.04-1.85 0-2.14 1.45-2.14 2.94v5.67H9.35V9h3.41v1.56h.05c.48-.9 1.64-1.85 3.37-1.85 3.6 0 4.27 2.37 4.27 5.46v6.28zM5.34 7.43a2.06 2.06 0 1 1 0-4.13 2.06 2.06 0 0 1 0 4.13zm1.78 13.02H3.56V9h3.56v11.45zM22.22 0H1.77C.79 0 0 .77 0 1.73v20.54C0 23.23.79 24 1.77 24h20.45c.98 0 1.78-.77 1.78-1.73V1.73C24 .77 23.2 0 22.22 0z';
+const GITHUB_PATH =
+  'M12 .3a12 12 0 0 0-3.8 23.4c.6.1.82-.26.82-.58l-.01-2.04c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.07 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.13-.3-.54-1.52.12-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.3-1.55 3.3-1.23 3.3-1.23.66 1.66.25 2.88.12 3.18.77.84 1.23 1.91 1.23 3.22 0 4.61-2.8 5.63-5.48 5.92.43.37.81 1.1.81 2.22l-.01 3.29c0 .32.22.69.82.57A12 12 0 0 0 12 .3z';
+
+/** Contact glyphs monochrome in the supplied color. Brand = solid fill for every
+ *  kind (email / phone / LinkedIn / GitHub); outline = line versions. */
+function ContactIcon({
+  kind,
+  size,
+  color,
+  variant,
+}: {
+  kind: ContactKind;
+  size: number;
+  color: string;
+  variant: 'brand' | 'outline';
+}) {
+  const common = {
+    width: size,
+    height: size,
+    viewBox: '0 0 24 24',
+    style: { flex: '0 0 auto', display: 'block' } as CSSProperties,
+    'aria-hidden': true as const,
+  };
+  const strokeProps = {
+    fill: 'none',
+    stroke: color,
+    strokeWidth: 2,
+    strokeLinecap: 'round' as const,
+    strokeLinejoin: 'round' as const,
+  };
+  const phonePath =
+    'M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92Z';
+  switch (kind) {
+    case 'email':
+      return variant === 'outline' ? (
+        <svg {...common} {...strokeProps}>
+          <rect x="2.5" y="4.5" width="19" height="15" rx="2.5" />
+          <path d="m3 6 9 6.5L21 6" />
+        </svg>
+      ) : (
+        <svg {...common} fill={color}>
+          <path d="M1.5 8.67v8.58a3 3 0 0 0 3 3h15a3 3 0 0 0 3-3V8.67l-8.928 5.493a3 3 0 0 1-3.144 0L1.5 8.67z" />
+          <path d="M22.5 6.908V6.75a3 3 0 0 0-3-3h-15a3 3 0 0 0-3 3v.158l9.714 5.978a1.5 1.5 0 0 0 1.572 0L22.5 6.908z" />
+        </svg>
+      );
+    case 'phone':
+      return variant === 'outline' ? (
+        <svg {...common} {...strokeProps}>
+          <path d={phonePath} />
+        </svg>
+      ) : (
+        <svg {...common} fill={color}>
+          <path d={phonePath} />
+        </svg>
+      );
+    case 'linkedin':
+      return variant === 'outline' ? (
+        <svg {...common} fill="none" stroke={color} strokeWidth={1.4} strokeLinejoin="round">
+          <path d={LINKEDIN_PATH} />
+        </svg>
+      ) : (
+        <svg {...common} fill={color}>
+          <path d={LINKEDIN_PATH} />
+        </svg>
+      );
+    case 'github':
+      return variant === 'outline' ? (
+        <svg {...common} fill="none" stroke={color} strokeWidth={1.4} strokeLinejoin="round">
+          <path d={GITHUB_PATH} />
+        </svg>
+      ) : (
+        <svg {...common} fill={color}>
+          <path d={GITHUB_PATH} />
+        </svg>
+      );
+    case 'location':
+      return variant === 'outline' ? (
+        <svg {...common} {...strokeProps}>
+          <path d="M12 21s7-7.75 7-13a7 7 0 1 0-14 0c0 5.25 7 13 7 13z" />
+          <circle cx="12" cy="9.5" r="2.5" />
+        </svg>
+      ) : (
+        <svg {...common} fill={color} fillRule="evenodd">
+          <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5A2.5 2.5 0 1 1 12 6a2.5 2.5 0 0 1 0 5.5z" />
+        </svg>
+      );
+    default:
+      return null;
+  }
+}
+
+/** Renders the Professional Summary section using a SummaryStyle. Shared by the live
+ *  preview and the style gallery thumbnails so the picker is a true preview. */
+export function SummaryBlock({
+  design,
+  style,
+  text,
+  marginTop = 0,
+  tagBlock = false,
+  title,
+  paragraphs,
+}: {
+  design: ResumeDesign;
+  style: SummaryStyle;
+  text: string;
+  marginTop?: number;
+  tagBlock?: boolean;
+  title?: string;
+  /** Multi-paragraph body (cover letters); each paragraph is its own page-break unit. */
+  paragraphs?: string[];
+}) {
+  const { typography: t, colors: c } = design;
+  const base = t.base_font_pt * PT_TO_PX;
+  const st = style ?? DEFAULT_SUMMARY_STYLE;
+  const upper = t.uppercase_headings;
+  const titleText = title ?? sectionTitle(design, 'summary');
+  const padPx = st.pad_pt * PT_TO_PX;
+  const onSolid = st.surface === 'solid' || st.surface === 'gradient';
+  const hasBox = st.surface !== 'none' || st.border !== 'none';
+
+  let background: string | undefined;
+  if (st.surface === 'tint') background = tint(c.accent, 0.12);
+  else if (st.surface === 'solid') background = c.accent;
+  else if (st.surface === 'gradient') background = `linear-gradient(135deg, ${c.accent}, ${tint(c.accent, 0.5)})`;
+
+  const borderColor = onSolid ? 'rgba(255,255,255,0.55)' : c.accent;
+  const titleColor = onSolid ? '#ffffff' : c.heading;
+  const accentColor = onSolid ? '#ffffff' : c.accent;
+  const textColor = onSolid ? 'rgba(255,255,255,0.94)' : c.text;
+
+  const container: CSSProperties = {
+    marginTop,
+    background,
+    borderRadius: st.radius_pt || 0,
+    padding: hasBox ? `${padPx}px ${padPx * 1.15}px` : 0,
+    color: textColor,
+    boxSizing: 'border-box',
+  };
+  switch (st.border) {
+    case 'full':
+      container.border = `1.5px solid ${borderColor}`;
+      break;
+    case 'left':
+      container.borderLeft = `3px solid ${borderColor}`;
+      break;
+    case 'top':
+      container.borderTop = `2px solid ${borderColor}`;
+      break;
+    case 'bottom':
+      container.borderBottom = `2px solid ${borderColor}`;
+      break;
+    case 'x':
+      container.borderTop = `1.5px solid ${borderColor}`;
+      container.borderBottom = `1.5px solid ${borderColor}`;
+      break;
+    default:
+      break;
+  }
+
+  const titleBase: CSSProperties = {
+    fontSize: base * t.heading_scale,
+    fontWeight: 700,
+    color: titleColor,
+    textTransform: upper ? 'uppercase' : 'none',
+    letterSpacing: upper ? '0.04em' : 0,
+    lineHeight: 1.2,
+    fontFamily: t.heading_font_family ? resumeFontStack(t.heading_font_family) : undefined,
+  };
+
+  const pStyle: CSSProperties = {
+    margin: 0,
+    lineHeight: t.line_spacing,
+    textAlign: st.align,
+    fontStyle: st.italic ? 'italic' : 'normal',
+    color: textColor,
+  };
+  const bodyP = paragraphs ? (
+    <div>
+      {paragraphs.map((para, i) => (
+        <p key={i} data-block style={{ ...pStyle, marginTop: i === 0 ? 0 : base * t.line_spacing * 0.75 }}>
+          {para.split('\n').map((line, j) => (
+            <span key={j}>
+              {j > 0 && <br />}
+              {line}
+            </span>
+          ))}
+        </p>
+      ))}
+    </div>
+  ) : (
+    <p style={pStyle}>{renderRich(text)}</p>
+  );
+
+  function stdTitle(center: boolean): ReactNode {
+    const ta: CSSProperties['textAlign'] = center ? 'center' : 'left';
+    if (st.title_accent === 'none' && !onSolid) {
+      // Plain summary titles follow the global heading treatment, like every section.
+      return (
+        <div style={{ ...sectionHeadingStyle(design, center || undefined), lineHeight: 1.2, marginBottom: 5 }}>{titleText}</div>
+      );
+    }
+    if (st.title_accent === 'bar') {
+      return (
+        <div style={{ marginBottom: 5, textAlign: ta }}>
+          <div style={{ width: 30, height: 3, background: accentColor, borderRadius: 2, margin: center ? '0 auto 5px' : '0 0 5px' }} />
+          <span style={{ ...titleBase }}>{titleText}</span>
+        </div>
+      );
+    }
+    if (st.title_accent === 'box') {
+      return (
+        <div style={{ marginBottom: 5, textAlign: ta }}>
+          <span style={{ ...titleBase, display: 'inline-block', background: accentColor, color: '#ffffff', padding: '2px 9px', borderRadius: 4 }}>
+            {titleText}
+          </span>
+        </div>
+      );
+    }
+    const underline = st.title_accent === 'underline' || (st.title_accent === 'none' && design.layout.accent_rule);
+    return (
+      <div
+        style={{
+          ...titleBase,
+          marginBottom: 5,
+          textAlign: ta,
+          borderBottom: underline ? `1.5px solid ${accentColor}` : 'none',
+          paddingBottom: underline ? 2 : 0,
+        }}
+      >
+        {st.title_accent === 'dot' && <span style={{ color: accentColor }}>{'\u25CF '}</span>}
+        {titleText}
+      </div>
+    );
+  }
+
+  function overlineTitle(center: boolean): ReactNode {
+    return (
+      <div style={{ textAlign: center ? 'center' : 'left', marginBottom: 6 }}>
+        <span style={{ display: 'inline-block', borderTop: `2px solid ${accentColor}`, paddingTop: 5 }}>
+          <span style={{ fontSize: base * 0.95, fontWeight: 700, color: titleColor, textTransform: 'uppercase', letterSpacing: '0.18em' }}>
+            {titleText}
+          </span>
+        </span>
+      </div>
+    );
+  }
+
+  function badgeTitle(center: boolean): ReactNode {
+    return (
+      <div style={{ textAlign: center ? 'center' : 'left', marginBottom: 6 }}>
+        <span
+          style={{
+            display: 'inline-block',
+            background: onSolid ? 'rgba(255,255,255,0.2)' : c.accent,
+            color: '#ffffff',
+            padding: '3px 12px',
+            borderRadius: 999,
+            fontSize: base * 0.82,
+            fontWeight: 700,
+            textTransform: 'uppercase',
+            letterSpacing: '0.1em',
+          }}
+        >
+          {titleText}
+        </span>
+      </div>
+    );
+  }
+
+  let inner: ReactNode;
+  if (st.title === 'hidden') {
+    inner = bodyP;
+  } else if (st.title === 'inline') {
+    inner = (
+      <p style={{ margin: 0, lineHeight: t.line_spacing, textAlign: st.align, fontStyle: st.italic ? 'italic' : 'normal', color: textColor }}>
+        <span style={{ fontWeight: 700, color: titleColor, textTransform: upper ? 'uppercase' : 'none', letterSpacing: upper ? '0.04em' : 0 }}>
+          {titleText}.{'  '}
+        </span>
+        {renderRich(text)}
+      </p>
+    );
+  } else if (st.title === 'side') {
+    inner = (
+      <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
+        <div style={{ flex: '0 0 28%' }}>{stdTitle(false)}</div>
+        <div style={{ flex: '1 1 72%' }}>{bodyP}</div>
+      </div>
+    );
+  } else if (st.title === 'overline') {
+    inner = (
+      <>
+        {overlineTitle(st.align === 'center')}
+        {bodyP}
+      </>
+    );
+  } else if (st.title === 'badge') {
+    inner = (
+      <>
+        {badgeTitle(st.align === 'center')}
+        {bodyP}
+      </>
+    );
+  } else if (st.title === 'centered') {
+    inner = (
+      <>
+        {stdTitle(true)}
+        {bodyP}
+      </>
+    );
+  } else {
+    inner = (
+      <>
+        {stdTitle(false)}
+        {bodyP}
+      </>
+    );
+  }
+
+  return (
+    <div {...(tagBlock ? { 'data-block': true } : {})} style={container}>
+      {inner}
+    </div>
+  );
+}
+
+/** Skill lists are plain terms: `**` emphasis is dropped so only the category label
+ *  carries weight, and any separator style ("a,b", "a; b", "a | b") becomes one list. */
+export function splitSkills(s?: string): string[] {
+  return (s || '')
+    .replace(/\*\*/g, '')
+    .split(/[,;|\n\u00b7\u2022]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+/** Renders the Technical Skills section using a SkillsStyle. Each skill within a
+ *  category is split into its own structured unit. Shared by the live preview and
+ *  the style gallery thumbnails. */
+export function SkillsBlock({
+  design,
+  style,
+  skills,
+}: {
+  design: ResumeDesign;
+  style: SkillsStyle;
+  skills: { category?: string; skills?: string }[];
+}) {
+  const { typography: t, colors: c } = design;
+  const base = t.base_font_pt * PT_TO_PX;
+  const st = style ?? DEFAULT_SKILLS_STYLE;
+  const padPx = st.pad_pt * PT_TO_PX;
+
+  const catLabel = (text: string): ReactNode => {
+    const upper = st.category === 'caps';
+    const color = st.category === 'accent' ? c.accent : c.heading;
+    const labelStyle: CSSProperties = {
+      fontWeight: 700,
+      color,
+      textTransform: upper ? 'uppercase' : 'none',
+      letterSpacing: upper ? '0.05em' : 0,
+      fontSize: base * (upper ? 0.92 : 1),
+    };
+    if (st.category === 'badge') {
+      return (
+        <span
+          style={{
+            display: 'inline-block',
+            background: c.accent,
+            color: '#ffffff',
+            padding: '1px 9px',
+            borderRadius: 999,
+            fontSize: base * 0.8,
+            fontWeight: 700,
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+          }}
+        >
+          {text}
+        </span>
+      );
+    }
+    if (st.category === 'bar') {
+      return (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ width: 3, height: base * 0.95, background: c.accent, borderRadius: 2, display: 'inline-block' }} />
+          <span style={labelStyle}>{text}</span>
+        </span>
+      );
+    }
+    return <span style={labelStyle}>{text}</span>;
+  };
+
+  const chip = (skill: string, i: number): ReactNode => {
+    const accent = st.accent_chips;
+    return (
+      <span
+        key={i}
+        style={{
+          display: 'inline-block',
+          fontSize: base * 0.9,
+          lineHeight: 1.35,
+          padding: '1px 8px',
+          borderRadius: 6,
+          background: accent ? tint(c.accent, 0.14) : '#f1f5f9',
+          color: accent ? c.accent : c.text,
+          border: `1px solid ${accent ? tint(c.accent, 0.45) : '#e2e8f0'}`,
+        }}
+      >
+        {skill}
+      </span>
+    );
+  };
+
+  const bodyText: CSSProperties = { color: c.text, lineHeight: t.line_spacing, fontWeight: 400 };
+
+  // Per-skill bullet lists (one term per line) were dropped; coerce to chips.
+  const layout = st.layout === 'bullets' ? 'chips' : st.layout;
+
+  const renderCategory = (item: { category?: string; skills?: string }, idx: number): ReactNode => {
+    const cat = (item.category || '').trim();
+    const list = splitSkills(item.skills);
+    const labelGap = st.category === 'badge' ? ' ' : ': ';
+    let content: ReactNode;
+
+    switch (layout) {
+      case 'pipe':
+      case 'inline':
+        content = (
+          <p style={{ ...bodyText, margin: 0 }}>
+            {cat && (
+              <>
+                {catLabel(cat)}
+                <span style={{ color: c.text }}>{labelGap}</span>
+              </>
+            )}
+            <span style={{ color: c.text }}>{list.join(st.layout === 'pipe' ? '  |  ' : ', ')}</span>
+          </p>
+        );
+        break;
+      case 'stacked':
+        content = (
+          <div>
+            {cat && <div style={{ marginBottom: 2 }}>{catLabel(cat)}</div>}
+            <p style={{ ...bodyText, margin: 0 }}>{list.join(', ')}</p>
+          </div>
+        );
+        break;
+      case 'chips':
+        content = (
+          <div>
+            {cat && <div style={{ marginBottom: 3 }}>{catLabel(cat)}</div>}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>{list.map((sk, i) => chip(sk, i))}</div>
+          </div>
+        );
+        break;
+      case 'grid':
+      default:
+        content = (
+          <div style={{ display: 'flex', gap: 10, alignItems: 'baseline' }}>
+            <div style={{ flex: '0 0 32%' }}>{cat && catLabel(cat)}</div>
+            <div style={{ flex: '1 1 68%' }}>
+              {st.accent_chips ? (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>{list.map((sk, i) => chip(sk, i))}</div>
+              ) : (
+                <span style={{ color: c.text }}>{list.join(', ')}</span>
+              )}
+            </div>
+          </div>
+        );
+        break;
+    }
+
+    const wrap: CSSProperties = { marginBottom: st.surface === 'none' ? 3 : 5 };
+    if (st.surface === 'tint') {
+      wrap.background = tint(c.accent, 0.08);
+      wrap.borderRadius = st.radius_pt;
+      wrap.padding = `${padPx * 0.6}px ${padPx}px`;
+    } else if (st.surface === 'card') {
+      wrap.background = '#ffffff';
+      wrap.border = `1px solid ${tint(c.accent, 0.35)}`;
+      wrap.borderRadius = st.radius_pt;
+      wrap.padding = `${padPx * 0.6}px ${padPx}px`;
+      wrap.boxShadow = '0 1px 2px rgba(0,0,0,0.06)';
+    }
+    if (st.divider && st.surface === 'none') {
+      wrap.borderBottom = `1px solid ${tint(c.accent, 0.28)}`;
+      wrap.paddingBottom = 3;
+    }
+
+    return (
+      <div key={idx} data-block data-gap-role="skill" style={wrap}>
+        {content}
+      </div>
+    );
+  };
+
+  return <>{skills.map(renderCategory)}</>;
+}
+
+/** Gap above the "Key Contributions" subtitle and the Technologies line. Mirrored by
+ *  ``_EXP_SUBTITLE_GAP_PT`` in app/services/resume_builder_service.py. */
+const CONTRIBUTIONS_GAP_PX = 5;
+
+const MARKER_GLYPH: Record<string, string> = {
+  dot: '\u2022',
+  dash: '\u2013',
+  arrow: '\u2192',
+  chevron: '\u203A',
+  square: '\u25AA',
+  diamond: '\u25C6',
+};
+
+/** Normalized fields for one role, structured first with a legacy-description fallback. */
+function deriveExperience(design: ResumeDesign, w: WorkExperienceBlock): {
+  company: string;
+  role: string;
+  periodStr: string;
+  location: string;
+  employmentType: string;
+  arrangement: string;
+  projectTitle: string;
+  intro: string;
+  contributions: string[];
+  usedSkills: string;
+} {
+  const { projectTitle, intro, contributions } = deriveWorkContent(w);
+  return {
+    company: (w.company_name || '').trim(),
+    role: (w.job_title || '').trim(),
+    periodStr: period(design, w.period_start, w.period_end),
+    location: (w.location || '').trim(),
+    employmentType: (w.employment_type || '').trim(),
+    arrangement: (w.job_type || '').trim(),
+    projectTitle,
+    intro,
+    contributions,
+    usedSkills: (w.used_skills || '').trim(),
+  };
+}
+
+/** Renders the Work Experience section using an ExperienceStyle + control-board
+ *  toggles. Each contribution is split into its own bullet. Shared by the live
+ *  preview and the style gallery thumbnails so the picker is a true preview. */
+export function ExperienceBlock({
+  design,
+  style,
+  work,
+  showPeriod = true,
+  showLocation = true,
+}: {
+  design: ResumeDesign;
+  style: ExperienceStyle;
+  work: WorkExperienceBlock[];
+  showPeriod?: boolean;
+  showLocation?: boolean;
+}) {
+  const { typography: t, colors: c } = design;
+  const base = t.base_font_pt * PT_TO_PX;
+  const st = style ?? DEFAULT_EXPERIENCE_STYLE;
+  const padPx = st.pad_pt * PT_TO_PX;
+  const gapPx = st.entry_gap_pt * PT_TO_PX;
+
+  const bodyStyle: CSSProperties = {
+    color: c.text,
+    lineHeight: t.line_spacing,
+    fontSize: base,
+    overflowWrap: 'anywhere',
+    wordBreak: 'break-word',
+    maxWidth: '100%',
+  };
+  const mutedStyle: CSSProperties = {
+    color: c.muted,
+    fontSize: base * 0.92,
+    overflowWrap: 'anywhere',
+    wordBreak: 'break-word',
+  };
+
+  const companyColor = st.accent_target === 'company' ? c.accent : c.heading;
+  const roleColor = st.accent_target === 'role' ? c.accent : c.text;
+  const dateColor = st.accent_target === 'date' ? c.accent : c.muted;
+
+  const pill = (text: string, key: string): ReactNode => (
+    <span
+      key={key}
+      style={{
+        display: 'inline-block',
+        fontSize: base * 0.78,
+        fontWeight: 600,
+        lineHeight: 1.4,
+        padding: '0px 7px',
+        borderRadius: 999,
+        background: tint(c.accent, 0.14),
+        color: c.accent,
+        border: `1px solid ${tint(c.accent, 0.4)}`,
+        textTransform: 'capitalize',
+      }}
+    >
+      {text}
+    </span>
+  );
+
+  const skillChip = (skill: string, i: number, accent: boolean): ReactNode => (
+    <span
+      key={i}
+      style={{
+        display: 'inline-block',
+        fontSize: base * 0.85,
+        lineHeight: 1.35,
+        padding: '0px 7px',
+        borderRadius: accent ? 999 : 5,
+        background: accent ? tint(c.accent, 0.14) : '#f1f5f9',
+        color: accent ? c.accent : c.text,
+        border: `1px solid ${accent ? tint(c.accent, 0.4) : '#e2e8f0'}`,
+      }}
+    >
+      {renderRich(skill)}
+    </span>
+  );
+
+  const badges = (e: ReturnType<typeof deriveExperience>): { text: string }[] => {
+    const out: { text: string }[] = [];
+    if (st.show_employment_type && e.employmentType) out.push({ text: e.employmentType });
+    if (st.show_arrangement && e.arrangement) out.push({ text: e.arrangement });
+    return out;
+  };
+
+  const renderEntry = (w: WorkExperienceBlock, idx: number): ReactNode => {
+    const e = deriveExperience(design, w);
+    const bgs = badges(e);
+    const dateBits = [showPeriod ? e.periodStr : '', showLocation ? e.location : ''].filter(Boolean);
+    const inlineBadgeText = st.badge_style === 'inline' ? bgs.map((b) => b.text) : [];
+    const dateText = [...dateBits, ...inlineBadgeText].join('  |  ');
+    const pillBadges = st.badge_style === 'pill' ? bgs : [];
+
+    const companyEl = <span style={{ color: companyColor, fontWeight: 700 }}>{e.company}</span>;
+    const roleEl = e.role ? (
+      <span style={{ color: roleColor, fontWeight: st.accent_target === 'role' ? 600 : 400 }}>{e.role}</span>
+    ) : null;
+    const dateEl = dateText ? <span style={{ ...mutedStyle, color: dateColor }}>{dateText}</span> : null;
+
+    // ---- Header ----
+    let header: ReactNode;
+    if (st.header_layout === 'two_column') {
+      header = (
+        <TitleDateRow
+          right
+          title={
+            <>
+              {companyEl}
+              {roleEl ? <span style={{ color: c.text }}>{'  -  '}{roleEl}</span> : null}
+            </>
+          }
+          date={dateEl}
+        />
+      );
+    } else if (st.header_layout === 'stacked') {
+      header = (
+        <>
+          <TitleDateRow
+            right={st.date_position === 'right'}
+            title={<div style={{ color: companyColor, fontWeight: 700 }}>{e.company}</div>}
+            date={st.date_position === 'right' ? dateEl : null}
+          />
+          {roleEl ? <div style={{ marginTop: 0 }}>{roleEl}</div> : null}
+          {st.date_position !== 'right' && dateEl ? <div style={{ marginTop: 1 }}>{dateEl}</div> : null}
+        </>
+      );
+    } else {
+      // inline header
+      if (st.date_position === 'right') {
+        header = (
+          <TitleDateRow
+            right
+            title={
+              <>
+                {companyEl}
+                {roleEl ? <span style={{ color: c.text }}>{'  -  '}{roleEl}</span> : null}
+              </>
+            }
+            date={dateEl}
+          />
+        );
+      } else if (st.date_position === 'inline') {
+        header = (
+          <div style={{ minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+            {companyEl}
+            {roleEl ? <span style={{ color: c.text }}>{'  -  '}{roleEl}</span> : null}
+            {dateEl ? <span style={{ ...mutedStyle, color: dateColor }}>{'  \u00b7  '}{dateText}</span> : null}
+          </div>
+        );
+      } else {
+        // below
+        header = (
+          <>
+            <div style={{ minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+              {companyEl}
+              {roleEl ? <span style={{ color: c.text }}>{'  -  '}{roleEl}</span> : null}
+            </div>
+            {dateEl ? <div style={{ marginTop: 1 }}>{dateEl}</div> : null}
+          </>
+        );
+      }
+    }
+
+    // ---- Project title ----
+    let projectEl: ReactNode = null;
+    if (st.show_project_title && st.project_style !== 'hidden' && e.projectTitle) {
+      if (st.project_style === 'label') {
+        projectEl = (
+          <p data-gap-role="exp-lead" style={{ ...bodyStyle, margin: '2px 0 0' }}>
+            <span style={{ fontWeight: 700 }}>Project: </span>
+            {renderRich(e.projectTitle)}
+          </p>
+        );
+      } else if (st.project_style === 'bold') {
+        projectEl = <p data-gap-role="exp-lead" style={{ ...bodyStyle, margin: '2px 0 0', fontWeight: 700 }}>{renderRich(e.projectTitle)}</p>;
+      } else if (st.project_style === 'italic') {
+        projectEl = <p data-gap-role="exp-lead" style={{ ...bodyStyle, margin: '2px 0 0', fontStyle: 'italic' }}>{renderRich(e.projectTitle)}</p>;
+      } else {
+        projectEl = <p data-gap-role="exp-lead" style={{ ...bodyStyle, margin: '2px 0 0', color: c.accent, fontWeight: 700 }}>{renderRich(e.projectTitle)}</p>;
+      }
+    }
+
+    // ---- Intro ----
+    let introEl: ReactNode = null;
+    if (st.show_intro && st.intro_style !== 'hidden' && e.intro) {
+      const introStyle: CSSProperties = { ...bodyStyle, margin: '2px 0 0' };
+      if (st.intro_style === 'italic') introStyle.fontStyle = 'italic';
+      if (st.intro_style === 'indented') introStyle.paddingLeft = 10;
+      introEl = <p data-gap-role="exp-lead" style={introStyle}>{renderRich(e.intro)}</p>;
+    }
+
+    // ---- Pill badges row (when not inlined) ----
+    const pillRow =
+      pillBadges.length > 0 ? (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 3 }}>
+          {pillBadges.map((b, bi) => pill(b.text, `badge-${bi}`))}
+        </div>
+      ) : null;
+
+    // ---- Contributions label ----
+    let labelEl: ReactNode = null;
+    if (st.show_contributions_label && st.label_style !== 'hidden' && e.contributions.length > 0) {
+      const upper = st.label_style === 'caps';
+      labelEl = (
+        <p
+          data-block
+          data-gap-role="exp-label"
+          style={{
+            ...bodyStyle,
+            margin: `${CONTRIBUTIONS_GAP_PX}px 0 0`,
+            fontWeight: 700,
+            color: st.label_style === 'accent' ? c.accent : c.heading,
+            textTransform: upper ? 'uppercase' : 'none',
+            letterSpacing: upper ? '0.05em' : 0,
+            fontSize: upper ? base * 0.92 : base,
+          }}
+        >
+          Key Contributions
+        </p>
+      );
+    }
+
+    // ---- Contributions ----
+    const contributionEls = e.contributions.map((b, bi) => {
+      const marker = st.marker === 'numbered' ? `${bi + 1}.` : MARKER_GLYPH[st.marker] ?? '';
+      const textStyle: CSSProperties = {
+        overflowWrap: 'anywhere',
+        wordBreak: 'break-word',
+        minWidth: 0,
+        maxWidth: '100%',
+      };
+      // Uniform margin-top (not bottom) so consecutive body lines share the same gap,
+      // matches the PDF fill engine's space_before rhythm and avoids uneven measure noise.
+      const bodyLineGap = { margin: '2px 0 0', ...textStyle };
+      if (!marker) {
+        return (
+          <p key={bi} data-block data-gap-role="exp-bull" style={{ ...bodyStyle, ...bodyLineGap }}>
+            {renderRich(b)}
+          </p>
+        );
+      }
+      // Flex row keeps the marker tight to the text; minWidth:0 + overflowWrap keeps
+      // long unbroken tokens inside the page margins (PDF-editor style wrapping).
+      return (
+        <div
+          key={bi}
+          data-block
+          data-gap-role="exp-bull"
+          style={{
+            ...bodyStyle,
+            ...bodyLineGap,
+            display: 'flex',
+            gap: 5,
+            alignItems: 'baseline',
+            maxWidth: '100%',
+            minWidth: 0,
+          }}
+        >
+          <span style={{ flex: '0 0 auto', color: st.accent_target === 'none' ? c.text : c.accent, fontWeight: 700 }}>
+            {marker}
+          </span>
+          <span style={{ flex: '1 1 auto', ...textStyle }}>{renderRich(b)}</span>
+        </div>
+      );
+    });
+
+    // ---- Used skills ----
+    // Must carry data-block: the paginator only keeps whole [data-block] units
+    // across page edges. Without it, Technologies is hard-clipped mid-line
+    // (top half on page N, bottom half on page N+1).
+    let usedSkillsEl: ReactNode = null;
+    const usedList = splitSkills(e.usedSkills);
+    if (st.show_used_skills && st.used_skills_style !== 'hidden' && usedList.length > 0) {
+      if (st.used_skills_style === 'inline') {
+        usedSkillsEl = (
+          <p data-block data-gap-role="exp-used" style={{ ...bodyStyle, margin: `${CONTRIBUTIONS_GAP_PX}px 0 0`, fontSize: base * 0.95 }}>
+            <span style={{ fontWeight: 700, color: c.heading }}>Technologies: </span>
+            {usedList.join(', ')}
+          </p>
+        );
+      } else if (st.used_skills_style === 'label') {
+        usedSkillsEl = (
+          <p data-block data-gap-role="exp-used" style={{ ...bodyStyle, margin: `${CONTRIBUTIONS_GAP_PX}px 0 0`, fontSize: base * 0.95 }}>
+            <span style={{ fontWeight: 700, color: c.accent }}>Tech stack: </span>
+            {usedList.join(', ')}
+          </p>
+        );
+      } else {
+        const accent = st.used_skills_style === 'pill';
+        usedSkillsEl = (
+          <div data-block data-gap-role="exp-used" style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 4 }}>
+            {usedList.map((s, si) => skillChip(s, si, accent))}
+          </div>
+        );
+      }
+    }
+
+    // ---- Surface wrapper ----
+    const wrap: CSSProperties = { marginBottom: gapPx };
+    if (st.surface === 'card') {
+      wrap.border = `1px solid ${tint(c.accent, 0.22)}`;
+      wrap.borderRadius = st.radius_pt * PT_TO_PX;
+      wrap.padding = padPx || 12;
+      wrap.background = '#ffffff';
+      wrap.boxShadow = '0 1px 2px rgba(0,0,0,0.05)';
+    } else if (st.surface === 'tint') {
+      wrap.background = tint(c.accent, 0.07);
+      wrap.borderRadius = st.radius_pt * PT_TO_PX;
+      wrap.padding = padPx || 12;
+    } else if (st.surface === 'left_bar') {
+      wrap.borderLeft = `2.5px solid ${c.accent}`;
+      wrap.paddingLeft = padPx || 12;
+    } else if (st.surface === 'divider') {
+      wrap.borderBottom = `1px solid ${tint(c.accent, 0.24)}`;
+      wrap.paddingBottom = Math.max(gapPx - 4, 4);
+    }
+
+    return (
+      <div key={idx} style={wrap}>
+        <div data-block data-keep-next>
+          <div data-gap-role="exp-head">{header}</div>
+          {projectEl}
+          {introEl}
+          {pillRow}
+        </div>
+        {labelEl}
+        {contributionEls}
+        {usedSkillsEl}
+      </div>
+    );
+  };
+
+  if (work.length === 0) {
+    return (
+      <p style={{ ...mutedStyle, fontStyle: 'italic' }}>Add work experience in your profile to populate this section.</p>
+    );
+  }
+
+  return <>{work.map(renderEntry)}</>;
+}
+
+const CERT_MARKER_GLYPH: Record<string, string> = {
+  dot: '\u2022',
+  dash: '\u2013',
+  check: '\u2713',
+  arrow: '\u2192',
+  square: '\u25AA',
+  none: '',
+};
+
+export function EducationBlock({
+  design,
+  style,
+  education,
+}: {
+  design: ResumeDesign;
+  style: EducationStyle;
+  education: EducationBlock[];
+}) {
+  const { typography: t, colors: c } = design;
+  const base = t.base_font_pt * PT_TO_PX;
+  const st = style ?? DEFAULT_EDUCATION_STYLE;
+  const padPx = st.pad_pt * PT_TO_PX;
+  const gapPx = st.entry_gap_pt * PT_TO_PX;
+
+  const bodyStyle: CSSProperties = {
+    color: c.text,
+    lineHeight: t.line_spacing,
+    fontSize: base,
+    overflowWrap: 'anywhere',
+    wordBreak: 'break-word',
+    maxWidth: '100%',
+  };
+  const mutedStyle: CSSProperties = {
+    color: c.muted,
+    fontSize: base * 0.92,
+    overflowWrap: 'anywhere',
+    wordBreak: 'break-word',
+  };
+
+  const uniColor = st.accent_target === 'university' ? c.accent : c.heading;
+  const degreeColor = st.accent_target === 'degree' ? c.accent : c.text;
+
+  const renderEntry = (e: EducationBlock, idx: number): ReactNode => {
+    const uni = (e.university_name || '').trim();
+    const degree = (e.degree || '').trim();
+    const dateBits = [
+      st.show_period ? period(design, e.period_start, e.period_end) : '',
+      st.show_mark ? (e.mark || '').trim() : '',
+      st.show_location ? (e.location || '').trim() : '',
+    ].filter(Boolean);
+    const dateText = dateBits.join('  |  ');
+
+    const uniEl = uni ? <span style={{ color: uniColor, fontWeight: 700 }}>{uni}</span> : null;
+    const degreeEl = degree ? (
+      <span style={{ color: degreeColor, fontWeight: st.accent_target === 'degree' ? 600 : 400 }}>{degree}</span>
+    ) : null;
+    const dateEl = dateText ? <span style={{ ...mutedStyle }}>{dateText}</span> : null;
+
+    let header: ReactNode;
+    if (st.header_layout === 'stacked') {
+      header = (
+        <>
+          <TitleDateRow right={st.date_position === 'right'} title={<div>{uniEl}</div>} date={st.date_position === 'right' ? dateEl : null} />
+          {degreeEl ? <div style={{ marginTop: 0 }}>{degreeEl}</div> : null}
+          {st.date_position !== 'right' && dateEl ? <div style={{ marginTop: 1 }}>{dateEl}</div> : null}
+        </>
+      );
+    } else if (st.date_position === 'right') {
+      header = (
+        <TitleDateRow
+          right
+          title={
+            <>
+              {uniEl}
+              {degreeEl ? <span style={{ color: c.text }}>{'  -  '}{degreeEl}</span> : null}
+            </>
+          }
+          date={dateEl}
+        />
+      );
+    } else if (st.date_position === 'inline') {
+      header = (
+        <div style={{ minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+          {uniEl}
+          {degreeEl ? <span style={{ color: c.text }}>{'  -  '}{degreeEl}</span> : null}
+          {dateEl ? <span style={{ ...mutedStyle }}>{'  \u00b7  '}{dateText}</span> : null}
+        </div>
+      );
+    } else {
+      header = (
+        <>
+          <div style={{ minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+            {uniEl}
+            {degreeEl ? <span style={{ color: c.text }}>{'  -  '}{degreeEl}</span> : null}
+          </div>
+          {dateEl ? <div style={{ marginTop: 1 }}>{dateEl}</div> : null}
+        </>
+      );
+    }
+
+    const descEl =
+      st.show_description && (e.description || '').trim() ? (
+        <p style={{ ...bodyStyle, margin: '2px 0 0' }}>{renderRich((e.description || '').trim())}</p>
+      ) : null;
+
+    const wrap: CSSProperties = { marginBottom: gapPx, minWidth: 0, maxWidth: '100%' };
+    if (st.surface === 'card') {
+      wrap.border = `1px solid ${tint(c.accent, 0.22)}`;
+      wrap.borderRadius = st.radius_pt * PT_TO_PX;
+      wrap.padding = padPx || 12;
+      wrap.background = '#ffffff';
+      wrap.boxShadow = '0 1px 2px rgba(0,0,0,0.05)';
+    } else if (st.surface === 'tint') {
+      wrap.background = tint(c.accent, 0.07);
+      wrap.borderRadius = st.radius_pt * PT_TO_PX;
+      wrap.padding = padPx || 12;
+    } else if (st.surface === 'left_bar') {
+      wrap.borderLeft = `2.5px solid ${c.accent}`;
+      wrap.paddingLeft = padPx || 12;
+    } else if (st.surface === 'divider') {
+      wrap.borderBottom = `1px solid ${tint(c.accent, 0.24)}`;
+      wrap.paddingBottom = Math.max(gapPx - 4, 4);
+    }
+
+    return (
+      <div key={idx} data-block data-gap-role="edu" style={wrap}>
+        {header}
+        {descEl}
+      </div>
+    );
+  };
+
+  if (education.length === 0) {
+    return <p style={{ ...mutedStyle, fontStyle: 'italic' }}>Add education in your profile to populate this section.</p>;
+  }
+
+  return <>{education.map(renderEntry)}</>;
+}
+
+export function CertificatesBlock({
+  design,
+  style,
+  certificates,
+}: {
+  design: ResumeDesign;
+  style: CertificatesStyle;
+  certificates: CertificateBlock[];
+}) {
+  const { typography: t, colors: c } = design;
+  const base = t.base_font_pt * PT_TO_PX;
+  const st = style ?? DEFAULT_CERTIFICATES_STYLE;
+  const padPx = st.pad_pt * PT_TO_PX;
+
+  const bodyStyle: CSSProperties = {
+    color: c.text,
+    lineHeight: t.line_spacing,
+    fontSize: base,
+    overflowWrap: 'anywhere',
+    wordBreak: 'break-word',
+    maxWidth: '100%',
+  };
+  const mutedStyle: CSSProperties = {
+    color: c.muted,
+    fontSize: base * 0.92,
+    overflowWrap: 'anywhere',
+    wordBreak: 'break-word',
+  };
+  const items = certificates.filter((e) => (e.name || '').trim());
+
+  if (items.length === 0) {
+    return <p style={{ ...mutedStyle, fontStyle: 'italic' }}>Add certifications in your profile to populate this section.</p>;
+  }
+
+  const ensureHttp = (u: string) => (/^https?:\/\//i.test(u) ? u : `https://${u.replace(/^\/+/, '')}`);
+
+  const certNameNode = (cert: CertificateBlock, color: string): ReactNode => {
+    const name = (cert.name || '').trim();
+    const href = (cert.url || '').trim();
+    if (!href) return name;
+    return (
+      <a href={ensureHttp(href)} target="_blank" rel="noopener noreferrer" style={{ color, textDecoration: 'none' }}>
+        {name}
+      </a>
+    );
+  };
+
+  const certLabel = (cert: CertificateBlock, color: string = c.text): ReactNode => {
+    const issued = formatFlexibleDate(cert.issued_at, '', dateStyleOf(design));
+    return (
+      <>
+        {certNameNode(cert, color)}
+        {issued ? <span style={{ color: c.muted }}> ({issued})</span> : null}
+      </>
+    );
+  };
+
+  const surface: CSSProperties = {};
+  if (st.surface === 'card') {
+    surface.border = `1px solid ${tint(c.accent, 0.22)}`;
+    surface.borderRadius = st.radius_pt * PT_TO_PX;
+    surface.padding = padPx || 12;
+    surface.background = '#ffffff';
+  } else if (st.surface === 'tint') {
+    surface.background = tint(c.accent, 0.07);
+    surface.borderRadius = st.radius_pt * PT_TO_PX;
+    surface.padding = padPx || 12;
+  }
+
+  const chip = (cert: CertificateBlock, i: number): ReactNode => {
+    const chipColor = st.accent_chips ? c.accent : c.text;
+    return (
+      <span
+        key={i}
+        style={{
+          display: 'inline-block',
+          fontSize: base * 0.9,
+          lineHeight: 1.4,
+          padding: '1px 9px',
+          borderRadius: st.accent_chips ? 999 : 5,
+          background: st.accent_chips ? tint(c.accent, 0.14) : '#f1f5f9',
+          color: chipColor,
+          border: `1px solid ${st.accent_chips ? tint(c.accent, 0.4) : '#e2e8f0'}`,
+        }}
+      >
+        {certLabel(cert, chipColor)}
+      </span>
+    );
+  };
+
+  let content: ReactNode;
+  if (st.layout === 'inline') {
+    content = (
+      <p style={{ ...bodyStyle, margin: 0 }}>
+        {items.map((cert, i) => (
+          <span key={i}>
+            {i > 0 ? ', ' : ''}
+            {certLabel(cert)}
+          </span>
+        ))}
+      </p>
+    );
+  } else if (st.layout === 'pipe') {
+    content = (
+      <p style={{ ...bodyStyle, margin: 0 }}>
+        {items.map((cert, i) => (
+          <span key={i}>
+            {i > 0 ? '  |  ' : ''}
+            {certLabel(cert)}
+          </span>
+        ))}
+      </p>
+    );
+  } else if (st.layout === 'chips') {
+    content = (
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>{items.map((cert, i) => chip(cert, i))}</div>
+    );
+  } else if (st.layout === 'grid') {
+    content = (
+      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${st.columns}, minmax(0, 1fr))`, columnGap: 16, rowGap: 2 }}>
+        {items.map((cert, i) => {
+          const marker = CERT_MARKER_GLYPH[st.marker] ?? '';
+          if (!marker) {
+            return (
+              <p key={i} data-block data-gap-role="cert" style={{ ...bodyStyle, margin: '0 0 1px' }}>
+                {certLabel(cert)}
+              </p>
+            );
+          }
+          return (
+            <div key={i} data-block data-gap-role="cert" style={{ ...bodyStyle, margin: '0 0 1px', display: 'flex', gap: 5, alignItems: 'baseline' }}>
+              <span style={{ flex: '0 0 auto', color: c.accent, fontWeight: 700 }}>{marker}</span>
+              <span style={{ flex: '1 1 auto', minWidth: 0 }}>{certLabel(cert)}</span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  } else {
+    // list
+    const rows = items.map((cert, i) => {
+      const marker = CERT_MARKER_GLYPH[st.marker] ?? '';
+      if (!marker) {
+        return (
+          <p key={i} data-block data-gap-role="cert" style={{ ...bodyStyle, margin: '0 0 1px' }}>
+            {certLabel(cert)}
+          </p>
+        );
+      }
+      return (
+        <div key={i} data-block data-gap-role="cert" style={{ ...bodyStyle, margin: '0 0 1px', display: 'flex', gap: 5, alignItems: 'baseline' }}>
+          <span style={{ flex: '0 0 auto', color: c.accent, fontWeight: 700 }}>{marker}</span>
+          <span style={{ flex: '1 1 auto', minWidth: 0 }}>{certLabel(cert)}</span>
+        </div>
+      );
+    });
+    content =
+      st.columns === 2 ? (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', columnGap: 16, rowGap: 2 }}>{rows}</div>
+      ) : (
+        <>{rows}</>
+      );
+  }
+
+  return Object.keys(surface).length > 0 ? <div data-block style={surface}>{content}</div> : <div data-block>{content}</div>;
+}
+
+// Same spacing as `_render_extra_section` in the .docx compiler (pt).
+const EXTRA_ENTRY_GAP_PT = 6;
+const EXTRA_BULLET_INDENT_PT = 11;
+
+export function filledExtraItems(section: ExtraSection): ExtraItem[] {
+  return section.items.filter((i) => i.title.trim() || i.subtitle.trim() || i.bullets.some((b) => b.trim()));
+}
+
+function extraPeriod(design: ResumeDesign, item: ExtraItem): string {
+  const style = dateStyleOf(design);
+  if (item.date_start.trim()) return formatFlexiblePeriod(item.date_start, item.date_end, style);
+  return formatFlexibleDate(item.date_end, '', style);
+}
+
+function ExtraSectionBlock({ design, section, items }: { design: ResumeDesign; section: ExtraSection; items: ExtraItem[] }) {
+  const { typography: t, colors: c } = design;
+  const base = t.base_font_pt * PT_TO_PX;
+  const sub = base * 0.92;
+  const line: CSSProperties = { lineHeight: t.line_spacing, color: c.text };
+  const bulletRow = (key: string | number, children: ReactNode, marginTop: number) => (
+    <div key={key} data-block style={{ ...line, display: 'flex', marginTop }}>
+      <span style={{ flex: `0 0 ${EXTRA_BULLET_INDENT_PT * PT_TO_PX}px`, color: c.accent }}>{'\u2022'}</span>
+      <span style={{ flex: '1 1 auto', minWidth: 0 }}>{children}</span>
+    </div>
+  );
+  const titleRuns = (item: ExtraItem, boldTitle: boolean) => (
+    <>
+      {item.title.trim() && <span style={{ fontWeight: boldTitle ? 700 : 400 }}>{item.title.trim()}</span>}
+      {item.subtitle.trim() && (
+        <span style={{ color: boldTitle ? c.text : c.muted }}>
+          {item.title.trim() ? ', ' : ''}
+          {item.subtitle.trim()}
+        </span>
+      )}
+    </>
+  );
+
+  if (section.layout === 'inline') {
+    return (
+      <div data-block style={line}>
+        {items.map((item, i) => (
+          <span key={i}>
+            {i > 0 && <span style={{ color: c.muted, whiteSpace: 'pre' }}>{'  \u00b7  '}</span>}
+            {item.title.trim()}
+            {item.subtitle.trim() && <span style={{ color: c.muted }}> ({item.subtitle.trim()})</span>}
+          </span>
+        ))}
+      </div>
+    );
+  }
+
+  if (section.layout === 'columns') {
+    return (
+      <div data-block style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', rowGap: EXTRA_ENTRY_GAP_PT * PT_TO_PX }}>
+        {items.map((item, i) => (
+          <div key={i} style={{ ...line, minWidth: 0, paddingRight: 6 * PT_TO_PX }}>
+            <span style={{ fontWeight: 700 }}>{item.title.trim()}</span>
+            {item.subtitle.trim() && <span style={{ color: c.muted, fontSize: sub, whiteSpace: 'pre-wrap' }}>{`  ${item.subtitle.trim()}`}</span>}
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  if (section.layout === 'list') {
+    return (
+      <div>
+        {items.map((item, i) => {
+          const when = extraPeriod(design, item);
+          return bulletRow(
+            i,
+            <>
+              {titleRuns(item, false)}
+              {when && <span style={{ color: c.muted }}> ({when})</span>}
+            </>,
+            i === 0 ? 0 : 1 * PT_TO_PX,
+          );
+        })}
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {items.map((item, i) => {
+        const when = extraPeriod(design, item);
+        return (
+          <div key={i} style={{ marginTop: i === 0 ? 0 : EXTRA_ENTRY_GAP_PT * PT_TO_PX }}>
+            <div data-block style={line}>
+              <TitleDateRow
+                title={titleRuns(item, true)}
+                date={when ? <span style={{ color: c.muted, fontSize: sub }}>{when}</span> : null}
+                right
+              />
+            </div>
+            {item.location.trim() && (
+              <div data-block style={{ ...line, color: c.muted, fontSize: sub }}>
+                {item.location.trim()}
+              </div>
+            )}
+            {item.bullets
+              .filter((b) => b.trim())
+              .map((b, j) => bulletRow(j, b.trim(), 1.5 * PT_TO_PX))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function ResumePreview({ design, profile, paged = false, letter = null }: ResumePreviewProps) {
+  const { typography: t, colors: c, layout: l, sections: opts } = design;
+  const base = t.base_font_pt * PT_TO_PX;
+  const mSides = marginSides(l);
+  const hpSides = headerPadSides(l);
+  const mTopPx = mSides.top * PT_TO_PX;
+  const mRightPx = mSides.right * PT_TO_PX;
+  const mBottomPx = mSides.bottom * PT_TO_PX;
+  const mLeftPx = mSides.left * PT_TO_PX;
+
+  // Render with the same font the .docx/PDF uses so wrapping and page breaks match.
+  const fontStack = useMemo(() => resumeFontStack(t.font_family), [t.font_family]);
+
+  const skills = asArray<TechnicalSkillBlock>(profile?.technical_skills).filter((s) => (s.category || s.skills));
+  const work = asArray<WorkExperienceBlock>(profile?.work_experience).filter((w) => (w.company_name || w.job_title));
+  const education = asArray<EducationBlock>(profile?.education).filter((e) => (e.university_name || e.degree));
+  const certificates = asArray<CertificateBlock>(profile?.certificates).filter((e) => e.name);
+
+  const extras = new Map<string, { section: ExtraSection; items: ExtraItem[] }>();
+  for (const section of design.extra_sections ?? []) {
+    const items = filledExtraItems(section);
+    if (items.length) extras.set(section.id, { section, items });
+  }
+
+  const order: SectionId[] = letter ? ['summary'] : l.section_order.filter((s) => !l.hidden_sections.includes(s));
+  const visible = order.filter((s) => {
+    if (isExtraSectionId(s)) return extras.has(s);
+    if (s === 'skills') return skills.length > 0;
+    if (s === 'education') return education.length > 0;
+    if (s === 'certificates') return certificates.length > 0;
+    return true;
+  });
+
+  const headingStyle: CSSProperties = {
+    ...sectionHeadingStyle(design),
+    marginBottom: 5,
+    marginTop: l.section_gap_pt * PT_TO_PX,
+  };
+
+  function Heading({ id }: { id: SectionId }) {
+    return <div data-block data-gap-role="heading" style={headingStyle}>{sectionTitle(design, id)}</div>;
+  }
+
+  function renderSection(id: SectionId) {
+    const extra = extras.get(id);
+    if (extra) {
+      return (
+        <div key={id}>
+          <Heading id={id} />
+          <ExtraSectionBlock design={design} section={extra.section} items={extra.items} />
+        </div>
+      );
+    }
+    switch (id) {
+      case 'summary':
+        return (
+          <SummaryBlock
+            key={id}
+            design={design}
+            style={opts.summary_style ?? DEFAULT_SUMMARY_STYLE}
+            text={
+              profile?.profile_summary?.trim() ||
+              'Experienced professional with a track record of delivering measurable results across cross-functional teams.'
+            }
+            marginTop={l.section_gap_pt * PT_TO_PX}
+            tagBlock
+            title={letter ? letter.title ?? 'Cover Letter' : undefined}
+            paragraphs={letter ? letter.paragraphs : undefined}
+          />
+        );
+      case 'skills':
+        return (
+          <div key={id}>
+            <Heading id={id} />
+            <SkillsBlock design={design} style={opts.skills_style ?? DEFAULT_SKILLS_STYLE} skills={skills} />
+          </div>
+        );
+      case 'experience':
+        return (
+          <div key={id}>
+            <Heading id={id} />
+            <ExperienceBlock
+              design={design}
+              style={opts.experience_style ?? DEFAULT_EXPERIENCE_STYLE}
+              work={work}
+              showPeriod={opts.show_period}
+              showLocation={opts.show_location}
+            />
+          </div>
+        );
+      case 'education':
+        return (
+          <div key={id}>
+            <Heading id={id} />
+            <EducationBlock design={design} style={opts.education_style ?? DEFAULT_EDUCATION_STYLE} education={education} />
+          </div>
+        );
+      case 'certificates':
+        return (
+          <div key={id}>
+            <Heading id={id} />
+            <CertificatesBlock design={design} style={opts.certificates_style ?? DEFAULT_CERTIFICATES_STYLE} certificates={certificates} />
+          </div>
+        );
+      default:
+        return null;
+    }
+  }
+
+  const headerImage = l.header_background === 'image' ? l.header_image ?? null : null;
+  const onDark = l.header_background === 'solid' || (!!headerImage && headerImage.text === 'light');
+  const bandBg =
+    l.header_background === 'solid'
+      ? c.accent
+      : l.header_background === 'soft'
+        ? tint(c.accent, 0.14)
+        : headerImage
+          ? '#0f172a'
+          : undefined;
+  const nameColor = headerImage ? (headerImage.text === 'light' ? '#ffffff' : '#0f172a') : onDark ? '#ffffff' : c.heading;
+  const titleColor = headerImage
+    ? headerImage.text === 'light'
+      ? '#f1f5f9'
+      : '#334155'
+    : onDark
+      ? '#f1f5f9'
+      : c.accent;
+  const contactColor = headerImage
+    ? headerImage.text === 'light'
+      ? '#ffffff'
+      : '#334155'
+    : onDark
+      ? '#ffffff'
+      : c.muted;
+  const contactStyle: CSSProperties = {
+    color: contactColor,
+    fontSize: base * 0.92,
+    // Soft shadow keeps contacts readable over bright spots in photo headers.
+    textShadow:
+      headerImage && headerImage.text === 'light'
+        ? '0 1px 2px rgba(0,0,0,0.55), 0 0 8px rgba(0,0,0,0.35)'
+        : onDark
+          ? '0 1px 2px rgba(0,0,0,0.45)'
+          : undefined,
+  };
+
+  const photo = !letter && l.photo?.enabled && l.photo.data_url ? l.photo : null;
+  const photoPx = photo ? (PHOTO_SIZE_PT[photo.size] ?? PHOTO_SIZE_PT.md) * PT_TO_PX : 0;
+  const photoEl = photo ? (
+    // Decorative: name and contacts stay as real text ahead of it for ATS parsers.
+    <img
+      data-resume-photo
+      src={photo.data_url}
+      alt=""
+      aria-hidden
+      width={photoPx}
+      height={photoPx}
+      style={{
+        display: 'block',
+        flex: '0 0 auto',
+        width: photoPx,
+        height: photoPx,
+        objectFit: 'cover',
+        borderRadius: PHOTO_RADIUS[photo.shape] ?? '50%',
+        margin: l.header_align === 'center' ? `0 auto ${6 * PT_TO_PX}px` : undefined,
+      }}
+    />
+  ) : null;
+
+  const header = (
+    <div
+      data-block
+      data-header-band
+      style={{
+        textAlign: l.header_align,
+        marginBottom: bandBg ? 0 : hpSides.bottom * PT_TO_PX,
+        background: bandBg,
+        // Stretch to fill, matches the .docx band picture (exact width × band height).
+        // `cover` + center was cropping a differently-aspect baked image than the PDF
+        // stretch, so the live preview and Accurate PDF showed different header scenes.
+        backgroundImage: headerImage ? `url(${headerImage.data_url})` : undefined,
+        backgroundSize: headerImage ? '100% 100%' : undefined,
+        backgroundRepeat: headerImage ? 'no-repeat' : undefined,
+        backgroundPosition: headerImage ? 'left top' : undefined,
+        padding: bandBg
+          ? `${hpSides.top * PT_TO_PX}px ${hpSides.right * PT_TO_PX}px ${hpSides.bottom * PT_TO_PX}px ${hpSides.left * PT_TO_PX}px`
+          : 0,
+      }}
+    >
+      {photoEl && l.header_align === 'center' && photoEl}
+      <div
+        style={
+          photoEl && l.header_align !== 'center'
+            ? { display: 'flex', alignItems: 'flex-start', gap: PHOTO_GAP_PT * PT_TO_PX }
+            : undefined
+        }
+      >
+        <div style={photoEl && l.header_align !== 'center' ? { flex: '1 1 auto', minWidth: 0 } : undefined}>
+          <div style={{ fontSize: base * t.name_scale, color: nameColor, fontWeight: 700, lineHeight: 1.1 }}>
+            {fullName(profile)}
+          </div>
+          {profile?.title && (
+            <div style={{ fontSize: base * 1.1, color: titleColor, marginTop: 2, lineHeight: 1.2 }}>{profile.title}</div>
+          )}
+          {(() => {
+            const items = contactItems(profile);
+            // Match .docx icon height (cap-height ≈ 0.66em) so contacts don't look larger
+            // in the live preview than in the Accurate PDF.
+            const iconSize = base * 0.66;
+            const justify = l.header_align === 'center' ? 'center' : 'flex-start';
+            const iconStyle = l.contact_icons === 'none' || l.contact_icons === 'outline' ? l.contact_icons : 'brand';
+            const showIcon = iconStyle !== 'none';
+            const variant: 'brand' | 'outline' = iconStyle === 'outline' ? 'outline' : 'brand';
+            const offX = (l.contact_icon_offset_x_pt ?? 0) * PT_TO_PX;
+            const offY = (l.contact_icon_offset_y_pt ?? 0) * PT_TO_PX;
+            const iconWrap: CSSProperties =
+              offX || offY
+                ? { display: 'block', transform: `translate(${offX}px, ${offY}px)`, flex: '0 0 auto' }
+                : { display: 'block', flex: '0 0 auto' };
+            if (l.contact_layout === 'stacked') {
+              return (
+                <div style={{ marginTop: 4, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  {items.map((it, i) => (
+                    <div key={i} style={{ ...contactStyle, display: 'flex', alignItems: 'center', gap: 6, justifyContent: justify }}>
+                      {showIcon && (
+                        <span style={iconWrap}>
+                          <ContactIcon kind={it.kind} size={iconSize} color={contactColor} variant={variant} />
+                        </span>
+                      )}
+                      <ContactText item={it} />
+                    </div>
+                  ))}
+                </div>
+              );
+            }
+            return (
+              <div
+                style={{
+                  ...contactStyle,
+                  marginTop: 4,
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  alignItems: 'center',
+                  gap: showIcon ? '3px 16px' : '3px 12px',
+                  justifyContent: justify,
+                  width: '100%',
+                  maxWidth: '100%',
+                  boxSizing: 'border-box',
+                }}
+              >
+                {items.map((it, i) => (
+                  <span
+                    key={i}
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      flex: '0 1 auto',
+                      minWidth: 0,
+                      maxWidth: '100%',
+                    }}
+                  >
+                    {showIcon && (
+                      <span style={iconWrap}>
+                        <ContactIcon kind={it.kind} size={iconSize} color={contactColor} variant={variant} />
+                      </span>
+                    )}
+                    <ContactText item={it} />
+                    {!showIcon && i < items.length - 1 && <span style={{ opacity: 0.5 }}>&nbsp;|</span>}
+                  </span>
+                ))}
+              </div>
+            );
+          })()}
+        </div>
+        {photoEl && l.header_align !== 'center' && photoEl}
+      </div>
+    </div>
+  );
+
+  const sidebarSet: SectionId[] = ['skills', 'education', 'certificates'];
+
+  const body =
+    l.columns === 2 && !letter ? (
+      <div style={{ display: 'flex', gap: 18, minWidth: 0, maxWidth: '100%' }}>
+        {/* minWidth:0 is required so flex children can shrink below content intrinsic width */}
+        <div style={{ flex: '0 0 34%', minWidth: 0, maxWidth: '34%' }}>
+          {visible.filter((s) => sidebarSet.includes(s)).map(renderSection)}
+        </div>
+        <div style={{ flex: '1 1 66%', minWidth: 0 }}>
+          {visible.filter((s) => !sidebarSet.includes(s)).map(renderSection)}
+        </div>
+      </div>
+    ) : (
+      <div style={{ minWidth: 0, maxWidth: '100%' }}>{visible.map(renderSection)}</div>
+    );
+
+  if (bandBg) {
+    return (
+      <div
+        style={{
+          fontFamily: fontStack,
+          fontSize: base,
+          color: c.text,
+          background: '#ffffff',
+          width: '100%',
+          boxSizing: 'border-box',
+          overflowWrap: 'anywhere',
+          wordBreak: 'break-word',
+        }}
+      >
+        {header}
+        <div style={{ padding: `${mTopPx * 0.6}px ${mRightPx}px ${paged ? 0 : mBottomPx}px ${mLeftPx}px` }}>{body}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        fontFamily: fontStack,
+        fontSize: base,
+        color: c.text,
+        background: '#ffffff',
+        padding: paged ? `0 ${mRightPx}px 0 ${mLeftPx}px` : `${mTopPx}px ${mRightPx}px ${mBottomPx}px ${mLeftPx}px`,
+        width: '100%',
+        boxSizing: 'border-box',
+        overflowWrap: 'anywhere',
+        wordBreak: 'break-word',
+      }}
+    >
+      {header}
+      {body}
+    </div>
+  );
+}

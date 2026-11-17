@@ -1,0 +1,1553 @@
+"""API routes for the scraper pipeline.
+
+Provides endpoints for browsing scraped jobs, viewing stats, listing
+available spiders, and triggering sync (spider runs) via arq.
+"""
+
+import json
+from app.utils.ttl_cache import AsyncTTLCache
+from datetime import date, datetime, timezone
+from typing import Literal, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field, field_validator, model_validator
+from sqlalchemy import func, select, desc
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.storage.database import get_session
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+scraper_router = APIRouter(prefix="/scraper", tags=["scraper"])
+
+
+# ---------------------------------------------------------------------------
+# Pydantic response models
+# ---------------------------------------------------------------------------
+
+class ScrapedJobResponse(BaseModel):
+    id: str
+    source: str
+    source_job_id: str
+    url: str
+    origin_url: Optional[str] = None
+    title: str
+    company_name: Optional[str] = None
+    location: Optional[str] = None
+    is_remote: bool = False
+
+    @field_validator("is_remote", mode="before")
+    @classmethod
+    def _coerce_is_remote(cls, v):
+        if v is None:
+            return False
+        return v
+
+    salary_raw: Optional[str] = None
+    salary_min_cents: Optional[int] = None
+    salary_max_cents: Optional[int] = None
+    salary_currency: Optional[str] = None
+    salary_period: Optional[str] = None
+    description: Optional[str] = None
+    job_type: Optional[str] = None
+    experience_level: Optional[str] = None
+    tags: list | None = None
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _parse_tags(cls, v):
+        if isinstance(v, str):
+            return json.loads(v)
+        return v
+
+    posted_at: Optional[datetime] = None
+    scraped_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    promoted_extraction_id: Optional[str] = None
+    promoted_at: Optional[datetime] = None
+
+    # Processing pipeline status (joined from related tables)
+    extraction_status: Optional[str] = None
+    job_id: Optional[str] = None
+    resume_build_status: Optional[str] = None
+    content_generation_status: Optional[str] = None
+    # AI match result for the current user (None when no analysis has run yet)
+    match_score: Optional[int] = None
+    match_in_progress: Optional[bool] = None
+    is_excluded_for_user: Optional[bool] = None
+
+    @field_validator("extraction_status", mode="before")
+    @classmethod
+    def _normalize_extraction_status(cls, v: object) -> object:
+        # The PostgreSQL 'extractionstatus' ENUM was originally created with
+        # uppercase labels (PENDING, PROCESSING, …).  Raw SQL via asyncpg
+        # returns those uppercase strings verbatim, bypassing SQLAlchemy's
+        # ORM-level enum coercion.  Normalise to lowercase here so that the
+        # TypeScript frontend comparisons ('pending', 'extracted', …) work.
+        if isinstance(v, str):
+            return v.lower()
+        return v
+
+
+class ScrapedJobUpdateRequest(BaseModel):
+    """Patch payload for editing a scraped job row.
+
+    At least one of ``url`` / ``origin_url`` / ``title`` / ``company_name``
+    / ``location`` must be present.  All fields are optional; only provided
+    fields are updated.  ``url``/``origin_url`` must be valid http(s) URLs
+    when supplied.
+    """
+    url: Optional[str] = None
+    origin_url: Optional[str] = None
+    title: Optional[str] = None
+    company_name: Optional[str] = None
+    location: Optional[str] = None
+
+
+class RerunResponse(BaseModel):
+    status: str
+    scraped_job_id: str
+    extraction_id: Optional[str] = None
+    job_id: Optional[str] = None
+    target_url: Optional[str] = None
+    enqueued: bool = False
+    message: str = ""
+
+
+class DeleteResponse(BaseModel):
+    status: str
+    scraped_job_id: str
+    message: str = ""
+
+
+class ScraperAiSearchRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=2000)
+
+
+class ScraperAiSearchResponse(BaseModel):
+    matching_jobs: list[dict]
+    query: dict       # serialised ScraperJobSearchQuerySpec (rationale + filters)
+    total_matching: int
+
+
+class ScrapedJobsPage(BaseModel):
+    items: list[ScrapedJobResponse]
+    total: int
+    page: int
+    per_page: int
+    pages: int
+
+
+class SourceStats(BaseModel):
+    source: str
+    count: int
+    latest_scraped: Optional[datetime] = None
+
+
+class BoardTrends(BaseModel):
+    """Last-7-day daily counts for the four main board side tiles."""
+    labels: list[str] = Field(default_factory=list)
+    dates: list[str] = Field(default_factory=list)
+    applied: list[int] = Field(default_factory=list)
+    ready: list[int] = Field(default_factory=list)
+    best: list[int] = Field(default_factory=list)
+    remote: list[int] = Field(default_factory=list)
+    available: list[int] = Field(default_factory=list)
+
+
+class AdminBoardTrends(BaseModel):
+    """Last-7-day daily counts for the admin ops board side tiles."""
+    labels: list[str] = Field(default_factory=list)
+    fetched: list[int] = Field(default_factory=list)
+    extracted: list[int] = Field(default_factory=list)
+    sheet_posted: list[int] = Field(default_factory=list)
+    pumble_posted: list[int] = Field(default_factory=list)
+
+
+class ScraperStatsResponse(BaseModel):
+    total_jobs: int
+    total_remote: int
+    unapplied_remote_jobs: int = 0  # remote and not yet applied
+    today_scraped: int = 0
+    today_remote: int = 0
+    today_posted: int = 0
+    my_jobs: int = 0          # jobs I added via submission/attachment
+    extracted_jobs: int = 0   # shared JD ready (extracted or completed)
+    ready_jobs: int = 0       # tailored resume ready AND not yet applied
+    today_ready_jobs: int = 0  # ready-to-apply among jobs added today
+    today_available_jobs: int = 0  # Scored (not ready, not applied) among jobs added today
+    best_jobs: int = 0        # match score >= 75 (Strong)
+    good_jobs: int = 0        # match score 50-74 (Good)
+    unapplied_good_jobs: int = 0  # match score >= 50 and not yet applied
+    qualified_jobs: int = 0   # match score >= user's preference minimum
+    scored_jobs: int = 0      # jobs with any match score
+    avg_match_score: int = 0  # average match score across scored jobs
+    available_jobs: int = 0   # Scored: match score computed, not resume-ready, not applied
+    applied_jobs: int = 0     # marked applied
+    applied_today: int = 0    # marked applied today
+    sheet_posted_jobs: int = 0
+    pumble_posted_jobs: int = 0
+    trends: BoardTrends = Field(default_factory=BoardTrends)
+    sources: list[SourceStats]
+    recent_runs: list[dict] = Field(default_factory=list)
+
+
+class PlatformSyncStats(BaseModel):
+    """Per registered job-site sync status for the admin board side rails."""
+    name: str
+    label: str
+    job_count: int = 0
+    last_sync_at: Optional[datetime] = None
+    last_items_new: int = 0
+    last_items_scraped: int = 0
+    last_items_updated: int = 0
+    last_errors: int = 0
+    last_status: str | None = None
+
+
+class AdminScraperStatsResponse(BaseModel):
+    """System-wide fetch → extract → post funnel for the admin Jobs board."""
+    total_jobs: int
+    total_remote: int
+    today_fetched: int = 0
+    today_scraped: int = 0  # alias of today_fetched for shared UI helpers
+    today_remote: int = 0
+    today_posted: int = 0
+    extracted_jobs: int = 0
+    needs_extraction_jobs: int = 0
+    extraction_failed_jobs: int = 0
+    extraction_pending_jobs: int = 0
+    sheet_posted_jobs: int = 0
+    pumble_posted_jobs: int = 0
+    manual_jobs: int = 0
+    team_applied_today: int = 0
+    last_sync_items_new: int = 0
+    last_sync_items_scraped: int = 0
+    last_sync_errors: int = 0
+    last_sync_at: Optional[datetime] = None
+    last_sync_spider: str | None = None
+    active_sources: int = 0
+    total_users: int = 0
+    new_users_week: int = 0
+    platform_sync: list[PlatformSyncStats] = Field(default_factory=list)
+    trends: AdminBoardTrends = Field(default_factory=AdminBoardTrends)
+    sources: list[SourceStats]
+    recent_runs: list[dict] = Field(default_factory=list)
+
+
+class ScrapeRunResponse(BaseModel):
+    id: str
+    spider_name: str
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    items_scraped: int = 0
+    items_new: int = 0
+    items_updated: int = 0
+    errors: int = 0
+    status: str = "running"
+
+
+class SyncRequest(BaseModel):
+    spider_name: str = "all"
+    sync_mode: Literal["incremental", "date_backfill"] = "incremental"
+    spider_names: list[str] | None = None
+    posted_since: date | None = None
+    posted_until: date | None = None
+
+    @model_validator(mode="after")
+    def _validate_sync(self):
+        if self.sync_mode == "date_backfill" and self.posted_since is None:
+            raise ValueError("posted_since is required when sync_mode is date_backfill")
+        if (
+            self.posted_since is not None
+            and self.posted_until is not None
+            and self.posted_since > self.posted_until
+        ):
+            raise ValueError("posted_since must be on or before posted_until")
+        return self
+
+
+class SyncPlatformInfo(BaseModel):
+    name: str
+    label: str
+    requires_auth: bool = False
+
+
+class SyncCheckpointInfo(BaseModel):
+    spider_name: str
+    marker_job_ids: list | dict
+    updated_at: Optional[datetime] = None
+
+
+class JobSyncScheduleUpdate(BaseModel):
+    enabled: bool = False
+    cadence: Literal["interval", "daily"] = "daily"
+    interval_hours: int = Field(default=4, ge=1, le=168)
+    daily_time: str = "04:30"
+    timezone: str = "America/Los_Angeles"
+    sync_mode: Literal["incremental", "date_backfill"] = "incremental"
+    lookback_days: int = Field(default=2, ge=1, le=90)
+    spider_names: list[str] | None = None
+
+
+class JobSyncScheduleResponse(BaseModel):
+    enabled: bool
+    cadence: Literal["interval", "daily"]
+    interval_hours: int
+    daily_time: str
+    timezone: str
+    sync_mode: Literal["incremental", "date_backfill"]
+    lookback_days: int
+    spider_names: list[str] | None = None
+    run_as_user_id: str | None = None
+    last_run_at: str | None = None
+    last_run_status: str | None = None
+    last_run_message: str | None = None
+    next_run_at: str | None = None
+    allowed_timezones: list[str] = Field(default_factory=list)
+
+
+class SyncStatusResponse(BaseModel):
+    status: str
+    spider_name: Optional[str] = None
+    message: str = ""
+    items_scraped: int = 0
+    items_new: int = 0
+    items_updated: int = 0
+    started_at: Optional[datetime] = None
+    elapsed_seconds: Optional[int] = None
+
+
+def _sync_running_message(spider: str, items_scraped: int, elapsed_seconds: int | None) -> str:
+    """Human-readable status line for GET /scraper/sync/status (running branch)."""
+    msg = f"Spider '{spider}' running - {items_scraped} scraped"
+    if elapsed_seconds is not None:
+        msg += f" ({elapsed_seconds}s elapsed)"
+    return msg + "."
+
+
+class SpiderInfo(BaseModel):
+    name: str
+    label: str
+    requires_auth: bool = False
+    auth_configured: bool = False
+    auth_saved_at: Optional[str] = None
+    auth_setup_command: Optional[str] = None
+    # RRS listing works without cookies; capture remains available but optional.
+    auth_optional: bool = False
+    token_expired: Optional[bool] = None
+    token_expires_at: Optional[str] = None
+
+
+class AuthPlatformStatus(BaseModel):
+    platform: str
+    label: str
+    exists: bool
+    corrupt: bool = False
+    saved_at: Optional[str] = None
+    cookie_count: int = 0
+    setup_command: str = ""
+    token_expired: Optional[bool] = None
+    token_expires_at: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+async def _get_current_user(request: Request):
+    """Reuse the same cookie-based JWT auth as the main routes."""
+    from app.api.routes import get_current_user
+    return await get_current_user(request)
+
+
+def _rerun_response_from_promote_outcome(
+    job_id: str,
+    outcome: dict,
+) -> RerunResponse:
+    """Map ``promote_single_scraped_row`` result to a :class:`RerunResponse`."""
+    bucket = outcome.get("bucket")
+    target_url = outcome.get("target_url")
+    if bucket == "new":
+        enqueued = bool(outcome.get("enqueued"))
+        message = (
+            "Promoted and enqueued for full lifecycle."
+            if enqueued
+            else "Promoted but extraction queue unavailable."
+        )
+        return RerunResponse(
+            status="enqueued" if enqueued else "enqueue_failed",
+            scraped_job_id=job_id,
+            extraction_id=outcome.get("extraction_id"),
+            job_id=outcome.get("job_id"),
+            target_url=target_url,
+            enqueued=enqueued,
+            message=message,
+        )
+    if bucket in ("exact_duplicate_dropped", "linked_existing"):
+        return RerunResponse(
+            status="duplicate",
+            scraped_job_id=job_id,
+            extraction_id=outcome.get("extraction_id"),
+            job_id=outcome.get("job_id"),
+            target_url=target_url,
+            enqueued=False,
+            message="Exact source URL already saved; skipped duplicate.",
+        )
+    if bucket == "linkedin_skipped":
+        return RerunResponse(
+            status="blocked",
+            scraped_job_id=job_id,
+            target_url=target_url,
+            message=outcome.get("error") or "LinkedIn job postings are not supported",
+        )
+    if bucket == "blocked":
+        return RerunResponse(
+            status="blocked",
+            scraped_job_id=job_id,
+            target_url=target_url,
+            message=outcome.get("error") or "Domain is blocked",
+        )
+    if bucket == "skipped_invalid_url":
+        return RerunResponse(
+            status="invalid_url",
+            scraped_job_id=job_id,
+            target_url=target_url,
+            message=outcome.get("error") or "Invalid URL",
+        )
+    return RerunResponse(
+        status="failed",
+        scraped_job_id=job_id,
+        target_url=target_url,
+        message=outcome.get("error") or "Promotion failed",
+    )
+
+
+async def _rerun_scraped_job_lifecycle(
+    scraped: dict,
+    *,
+    user_id: str | None,
+) -> RerunResponse:
+    """Re-promote / re-extract a scraped row for shared JD inventory.
+
+    Platform scraped jobs are always extraction-only (``pipeline_user_id=None``).
+    ``user_id`` is kept for API compatibility / logging only.
+    """
+    from sqlalchemy import text
+
+    from app.models.database import JobExtraction
+    from app.storage.repository import JobExtractionRepository
+    from app.services.url_manager import URLManager
+    from app.services.scrape_promoter import (
+        pick_target_url,
+        enqueue_extraction_for_url,
+        promote_single_scraped_row,
+    )
+
+    from app.services.linkedin_job_filter import linkedin_job_block_reason
+
+    # Shared catalog: never chain personal analyze/tailor from scraped-job rerun.
+    pipeline_user_id = None
+
+    job_id = str(scraped.get("id") or "")
+    target_url = pick_target_url(scraped)
+    if not target_url:
+        return RerunResponse(
+            status="invalid_url",
+            scraped_job_id=job_id,
+            message="Scraped job has no usable URL (origin_url and url are both empty)",
+        )
+
+    linkedin_reason = linkedin_job_block_reason(target_url)
+    if linkedin_reason:
+        return RerunResponse(
+            status="blocked",
+            scraped_job_id=job_id,
+            target_url=target_url,
+            message=linkedin_reason,
+        )
+
+    is_valid, validation_error = URLManager.validate_url(target_url)
+    if not is_valid:
+        return RerunResponse(
+            status="invalid_url",
+            scraped_job_id=job_id,
+            target_url=target_url,
+            message=f"Scraped URL is invalid: {validation_error or 'unknown error'}",
+        )
+
+    promoted_extraction_id = scraped.get("promoted_extraction_id")
+
+    if not promoted_extraction_id:
+        outcome = await promote_single_scraped_row(
+            scraped, scrape_run_id=None, enqueue=True, user_id=pipeline_user_id
+        )
+        return _rerun_response_from_promote_outcome(job_id, outcome)
+
+    async with get_session() as session:
+        extraction = await session.get(JobExtraction, promoted_extraction_id)
+        if not extraction:
+            await session.execute(
+                text("UPDATE scraped_jobs SET promoted_extraction_id = NULL WHERE id = :id"),
+                {"id": job_id},
+            )
+            await session.commit()
+            outcome = await promote_single_scraped_row(
+                scraped, scrape_run_id=None, enqueue=True, user_id=pipeline_user_id
+            )
+            result = _rerun_response_from_promote_outcome(job_id, outcome)
+            if result.status == "enqueued":
+                result.message = (
+                    "Stale promotion link cleared; re-promoted and enqueued for extraction."
+                )
+            return result
+
+        repo = JobExtractionRepository(session)
+        domain = URLManager.extract_domain(target_url)
+        await repo.reset_for_refresh(promoted_extraction_id, source_url=target_url, domain=domain)
+
+        from app.services.extraction_cache import invalidate_extraction_cache
+
+        await invalidate_extraction_cache(promoted_extraction_id)
+
+        vj_row = (await session.execute(
+            text(
+                "UPDATE jobs "
+                "SET source_url = :source_url, normalized_url = :normalized_url, domain = :d "
+                "WHERE extraction_id = :eid "
+                "RETURNING id"
+            ),
+            {
+                "source_url": target_url,
+                "normalized_url": target_url,
+                "d": domain,
+                "eid": promoted_extraction_id,
+            },
+        )).mappings().first()
+        valid_job_id: str | None = str(vj_row["id"]) if vj_row else None
+
+        await session.commit()
+
+    enqueued = await enqueue_extraction_for_url(
+        promoted_extraction_id, target_url, user_id=pipeline_user_id
+    )
+    return RerunResponse(
+        status="enqueued" if enqueued else "enqueue_failed",
+        scraped_job_id=job_id,
+        extraction_id=promoted_extraction_id,
+        job_id=valid_job_id,
+        target_url=target_url,
+        enqueued=enqueued,
+        message=(
+            "Existing extraction reset and re-enqueued (shared JD only)."
+            if enqueued
+            else "Extraction reset but queue unavailable."
+        ),
+    )
+
+
+def _raise_http_for_rerun_failure(result: RerunResponse) -> None:
+    """Convert a failed lifecycle result into the HTTP error the single endpoint used."""
+    if result.status in ("blocked", "invalid_url"):
+        raise HTTPException(status_code=400, detail=result.message)
+    if result.status == "enqueue_failed":
+        raise HTTPException(status_code=503, detail=result.message)
+    raise HTTPException(status_code=500, detail=result.message or "Rerun failed")
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@scraper_router.get("/jobs", response_model=ScrapedJobsPage)
+async def list_scraped_jobs(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    source: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+    remote_only: bool = Query(False),
+    sort: str = Query("scraped_at"),
+    order: str = Query("desc"),
+    user=Depends(_get_current_user),
+):
+    """Paginated list of scraped jobs with optional filters, including pipeline status."""
+    from sqlalchemy import text
+
+    async with get_session() as session:
+        user_id = user.get("user_id", "")
+
+        # Base SELECT: all scraped_jobs columns plus pipeline status fields.
+        #
+        # jobs resolution uses a two-step COALESCE subquery so we can
+        # find the linked valid_job even when a job was originally processed via
+        # the extraction page (promoted_extraction_id may be NULL) rather than
+        # via the scraper rerun button:
+        #
+        #   1. Primary:  look up jobs by extraction_id == promoted_extraction_id
+        #   2. Fallback: look up by normalized_url == COALESCE(origin_url, url)
+        #
+        # Each user_id bind parameter uses a unique name (rb_uid / jmr_uid /
+        # jmip_uid) to avoid asyncpg mapping all three occurrences to the same
+        # positional slot ($N), which can cause silent type-inference failures
+        # on some PostgreSQL / asyncpg version combinations.
+        #
+        # CASE WHEN … END returns an explicit SQL BOOLEAN rather than relying
+        # on asyncpg to infer the type of the IS NOT NULL expression.
+        # When multiple scraped_jobs share the same promoted_extraction_id
+        # they all point to the SAME processed job. Show only one row per
+        # unique extraction to avoid confusing "duplicate" entries.
+        dedup_filter = (
+            "AND ("
+            "  sj.promoted_extraction_id IS NULL "
+            "  OR sj.id = ("
+            "    SELECT sj2.id FROM scraped_jobs sj2 "
+            "    WHERE sj2.promoted_extraction_id = sj.promoted_extraction_id "
+            "    ORDER BY sj2.scraped_at DESC LIMIT 1"
+            "  )"
+            ") "
+        )
+
+        # Explicit columns, never SELECT sj.* (description TEXT is unused in list UI).
+        sj_cols = (
+            "sj.id, sj.source, sj.source_job_id, sj.url, sj.origin_url, sj.title, "
+            "sj.company_name, sj.location, sj.is_remote, sj.salary_raw, "
+            "sj.salary_min_cents, sj.salary_max_cents, sj.salary_currency, sj.salary_period, "
+            "sj.job_type, sj.experience_level, sj.tags, sj.posted_at, sj.scraped_at, "
+            "sj.updated_at, sj.promoted_extraction_id, sj.promoted_at"
+        )
+        # Prefer indexed joins over correlated COALESCE subqueries.
+        jobs_join = (
+            "LEFT JOIN LATERAL ("
+            "  SELECT v2.id FROM jobs v2 "
+            "  WHERE sj.promoted_extraction_id IS NOT NULL "
+            "    AND v2.extraction_id = sj.promoted_extraction_id "
+            "  LIMIT 1"
+            ") v_by_ext ON TRUE "
+            "LEFT JOIN LATERAL ("
+            "  SELECT v2.id FROM jobs v2 "
+            "  WHERE v2.normalized_url = COALESCE(sj.origin_url, sj.url) "
+            "    AND v2.status = 'active' "
+            "  ORDER BY v2.updated_at DESC LIMIT 1"
+            ") v_by_url ON TRUE "
+            "LEFT JOIN jobs vj ON vj.id = COALESCE(v_by_ext.id, v_by_url.id) "
+        )
+        base = (
+            f"SELECT {sj_cols}, "
+            "LOWER(je.status::text) AS extraction_status, "
+            "vj.id AS job_id, "
+            "rb.resume_pdf_status AS resume_build_status, "
+            "rb.content_generation_status AS content_generation_status, "
+            "jmr.overall_score AS match_score, "
+            "CASE WHEN jmip.id IS NOT NULL THEN TRUE ELSE FALSE END AS match_in_progress, "
+            "CASE WHEN ujs.id IS NOT NULL AND ujs.status != 'active' THEN TRUE ELSE FALSE END AS is_excluded_for_user "
+            "FROM scraped_jobs sj "
+            "LEFT JOIN job_extractions je ON je.id = sj.promoted_extraction_id "
+            + jobs_join
+            + "LEFT JOIN resume_build_results rb "
+            "  ON rb.job_id = vj.id AND rb.user_id = :rb_uid "
+            "LEFT JOIN job_match_results jmr "
+            "  ON jmr.job_id = vj.id AND jmr.user_id = :jmr_uid "
+            "LEFT JOIN job_match_in_progress jmip "
+            "  ON jmip.job_id = vj.id AND jmip.user_id = :jmip_uid "
+            "LEFT JOIN user_job_status ujs "
+            "  ON ujs.job_id = vj.id AND ujs.user_id = :ujs_uid "
+            "WHERE (vj.id IS NULL OR ujs.id IS NULL OR ujs.status = 'active') "
+            + dedup_filter
+        )
+        count_base = (
+            "SELECT COUNT(*) FROM scraped_jobs sj "
+            + jobs_join
+            + "LEFT JOIN user_job_status ujs "
+            "  ON ujs.job_id = vj.id AND ujs.user_id = :ujs_uid "
+            "WHERE (vj.id IS NULL OR ujs.id IS NULL OR ujs.status = 'active') "
+            + dedup_filter
+        )
+        params: dict = {
+            "rb_uid": user_id,
+            "jmr_uid": user_id,
+            "jmip_uid": user_id,
+            "ujs_uid": user_id,
+        }
+
+        if source:
+            base += " AND sj.source = :source"
+            count_base += " AND sj.source = :source"
+            params["source"] = source
+
+        if remote_only:
+            base += " AND sj.is_remote = true"
+            count_base += " AND sj.is_remote = true"
+
+        if q:
+            base += " AND (sj.title ILIKE :q OR sj.company_name ILIKE :q OR sj.location ILIKE :q)"
+            count_base += " AND (sj.title ILIKE :q OR sj.company_name ILIKE :q OR sj.location ILIKE :q)"
+            params["q"] = f"%{q}%"
+
+        count_result = await session.execute(text(count_base), params)
+        total = count_result.scalar() or 0
+
+        allowed_sort = {"scraped_at", "posted_at", "title", "company_name", "source", "updated_at"}
+        sort_col = sort if sort in allowed_sort else "scraped_at"
+        direction = "ASC" if order.lower() == "asc" else "DESC"
+        base += f" ORDER BY sj.{sort_col} {direction} NULLS LAST"
+
+        offset = (page - 1) * per_page
+        base += " LIMIT :limit OFFSET :offset"
+        params["limit"] = per_page
+        params["offset"] = offset
+
+        result = await session.execute(text(base), params)
+        rows = result.mappings().all()
+
+        items = [ScrapedJobResponse(**dict(row)) for row in rows]
+        pages = max(1, (total + per_page - 1) // per_page)
+
+        return ScrapedJobsPage(items=items, total=total, page=page, per_page=per_page, pages=pages)
+
+
+@scraper_router.post("/jobs/ai-search", response_model=ScraperAiSearchResponse)
+async def ai_search_scraped_jobs(
+    body: ScraperAiSearchRequest,
+    user=Depends(_get_current_user),
+):
+    """
+    Natural language search over scraped jobs.
+
+    Interprets the user's prompt with OpenAI into a structured filter spec
+    (ScraperJobSearchQuerySpec) then applies it as parameterised SQL across:
+      • scraped_jobs     – raw scraper output
+      • jobs             – structured extraction content (linked via COALESCE)
+      • job_extractions  – detailed responsibilities / requirements / salary
+      • job_match_results – per-user AI match score & recommendation
+      • resume_build_results – resume pipeline status
+    """
+    from app.services.scraper_ai_search_service import (
+        interpret_scraper_search_prompt,
+        apply_scraper_search_spec,
+    )
+    from app.core.exceptions import AIParsingError
+
+    user_id: str = user.get("user_id", "") if isinstance(user, dict) else ""
+
+    try:
+        spec = await interpret_scraper_search_prompt(body.prompt, user_id=user_id or None)
+    except AIParsingError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error("scraper_ai_search_interpret_failed", error=str(e))
+        raise HTTPException(
+            status_code=503,
+            detail="AI interpretation failed. Check OpenAI configuration and try again.",
+        )
+
+    try:
+        async with get_session() as session:
+            jobs, total = await apply_scraper_search_spec(
+                session, user_id, spec, limit=200
+            )
+    except Exception as e:
+        logger.error("scraper_ai_search_query_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Search query failed: {e}")
+
+    return ScraperAiSearchResponse(
+        matching_jobs=jobs,
+        query=spec.model_dump(mode="json"),
+        total_matching=total,
+    )
+
+
+class BatchJobIdsRequest(BaseModel):
+    job_ids: list[str] = Field(..., min_length=1)
+
+
+class BatchOperationResponse(BaseModel):
+    succeeded: list[str]
+    failed: list[str]
+    message: str = ""
+
+
+@scraper_router.post("/jobs/batch-delete", response_model=BatchOperationResponse)
+async def batch_delete_scraped_jobs(
+    body: BatchJobIdsRequest,
+    user=Depends(_get_current_user),
+):
+    """Delete multiple scraped job rows in one request.
+
+    Linked extractions and jobs are left intact.
+    """
+    from sqlalchemy import text
+
+    succeeded: list[str] = []
+    failed: list[str] = []
+
+    async with get_session() as session:
+        for job_id in body.job_ids:
+            try:
+                row = (await session.execute(
+                    text("SELECT id FROM scraped_jobs WHERE id = :id"),
+                    {"id": job_id},
+                )).first()
+                if not row:
+                    failed.append(job_id)
+                    continue
+                await session.execute(
+                    text("DELETE FROM scraped_jobs WHERE id = :id"),
+                    {"id": job_id},
+                )
+                succeeded.append(job_id)
+            except Exception as exc:
+                logger.warning("batch_delete_job_failed", job_id=job_id, error=str(exc))
+                failed.append(job_id)
+        await session.commit()
+
+    logger.info("batch_scraped_jobs_deleted", count=len(succeeded), failed=len(failed))
+    return BatchOperationResponse(
+        succeeded=succeeded,
+        failed=failed,
+        message=f"Deleted {len(succeeded)} job(s)."
+        + (f" {len(failed)} failed." if failed else ""),
+    )
+
+
+@scraper_router.post("/jobs/batch-rerun", response_model=BatchOperationResponse)
+async def batch_rerun_scraped_jobs(
+    body: BatchJobIdsRequest,
+    user=Depends(_get_current_user),
+):
+    """Trigger the full extraction → analysis → resume pipeline for multiple jobs."""
+    from sqlalchemy import text
+
+    user_id: str | None = user.get("user_id") if isinstance(user, dict) else None
+    succeeded: list[str] = []
+    failed: list[str] = []
+    seen_extraction_ids: set[str] = set()
+
+    for job_id in body.job_ids:
+        try:
+            async with get_session() as session:
+                row = (await session.execute(
+                    text("SELECT * FROM scraped_jobs WHERE id = :id"),
+                    {"id": job_id},
+                )).mappings().first()
+            if not row:
+                failed.append(job_id)
+                continue
+
+            ext_id = row.get("promoted_extraction_id")
+            if ext_id and ext_id in seen_extraction_ids:
+                succeeded.append(job_id)
+                continue
+            if ext_id:
+                seen_extraction_ids.add(ext_id)
+
+            result = await _rerun_scraped_job_lifecycle(dict(row), user_id=user_id)
+            if result.status == "enqueued" and result.enqueued:
+                succeeded.append(job_id)
+            else:
+                failed.append(job_id)
+                logger.warning(
+                    "batch_rerun_job_failed",
+                    job_id=job_id,
+                    status=result.status,
+                    error=result.message,
+                )
+        except Exception as exc:
+            logger.warning("batch_rerun_job_failed", job_id=job_id, error=str(exc))
+            failed.append(job_id)
+
+    logger.info("batch_scraped_jobs_rerun", count=len(succeeded), failed=len(failed))
+    return BatchOperationResponse(
+        succeeded=succeeded,
+        failed=failed,
+        message=f"Started pipeline for {len(succeeded)} job(s)."
+        + (f" {len(failed)} failed." if failed else ""),
+    )
+
+
+@scraper_router.get("/jobs/{job_id}", response_model=ScrapedJobResponse)
+async def get_scraped_job(job_id: str, user=Depends(_get_current_user)):
+    """Single scraped job by ID."""
+    from sqlalchemy import text
+
+    async with get_session() as session:
+        result = await session.execute(
+            text("SELECT * FROM scraped_jobs WHERE id = :id"),
+            {"id": job_id},
+        )
+        row = result.mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scraped job not found")
+        return ScrapedJobResponse(**dict(row))
+
+
+# Board tiles poll every few seconds; a short TTL turns N polls into one query.
+_STATS_CACHE = AsyncTTLCache(ttl=8.0)
+
+
+@scraper_router.get("/stats", response_model=ScraperStatsResponse)
+async def get_scraper_stats(
+    user=Depends(_get_current_user),
+    timezone: str | None = Query(None, description="IANA timezone for today's counts (browser local time)"),
+    member_id: str | None = Query(None, max_length=64, description="A team member the caller leads"),
+):
+    """Aggregate statistics aligned with the user's jobs dashboard."""
+    from app.api.team_access import insights_subject
+
+    user_id = user.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    user_id = await insights_subject(user_id, member_id)
+    return await _STATS_CACHE.get_or_compute(
+        ("user", user_id, timezone or ""),
+        lambda: _compute_scraper_stats(user_id, timezone),
+    )
+
+
+async def _compute_scraper_stats(user_id: str, timezone: str | None) -> ScraperStatsResponse:
+    from app.services.dashboard_stats import fetch_dashboard_stats
+    from app.utils.date_bounds import day_bounds_for_timezone
+
+    day_start, day_end = day_bounds_for_timezone(timezone)
+
+    async with get_session() as session:
+        from app.storage.user_repository import UserRepository
+        from app.services.weekly_progress import fetch_board_trend_series
+
+        min_score = await UserRepository(session).get_effective_min_match_score(user_id)
+        data = await fetch_dashboard_stats(
+            session,
+            user_id,
+            day_start=day_start,
+            day_end=day_end,
+            min_match_score=min_score,
+        )
+        trends = await fetch_board_trend_series(
+            session,
+            user_id,
+            tz_name=timezone,
+            days=7,
+        )
+
+        return ScraperStatsResponse(
+            total_jobs=data["total_jobs"],
+            total_remote=data["total_remote"],
+            unapplied_remote_jobs=data.get("unapplied_remote_jobs", 0),
+            today_scraped=data["today_scraped"],
+            today_remote=data["today_remote"],
+            today_posted=data["today_posted"],
+            my_jobs=data["my_jobs"],
+            extracted_jobs=data["extracted_jobs"],
+            ready_jobs=data["ready_jobs"],
+            today_ready_jobs=data.get("today_ready_jobs", 0),
+            today_available_jobs=data.get("today_available_jobs", 0),
+            best_jobs=data["best_jobs"],
+            good_jobs=data["good_jobs"],
+            unapplied_good_jobs=data.get("unapplied_good_jobs", 0),
+            qualified_jobs=data["qualified_jobs"],
+            scored_jobs=data["scored_jobs"],
+            avg_match_score=data["avg_match_score"],
+            available_jobs=data["available_jobs"],
+            applied_jobs=data["applied_jobs"],
+            applied_today=data["applied_today"],
+            sheet_posted_jobs=data["sheet_posted_jobs"],
+            pumble_posted_jobs=data["pumble_posted_jobs"],
+            trends=BoardTrends(**trends),
+            sources=[
+                SourceStats(
+                    source=row["source"],
+                    count=row["count"],
+                    latest_scraped=row["latest_scraped"],
+                )
+                for row in data["sources"]
+            ],
+            recent_runs=data["recent_runs"],
+        )
+
+
+@scraper_router.get("/stats/admin", response_model=AdminScraperStatsResponse)
+async def get_admin_scraper_stats(
+    user=Depends(_get_current_user),
+    timezone: str | None = Query(None, description="IANA timezone for today's counts (browser local time)"),
+):
+    """System-wide fetch → extract → post funnel for the admin Jobs board."""
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return await _STATS_CACHE.get_or_compute(
+        ("admin", timezone or ""),
+        lambda: _compute_admin_scraper_stats(timezone),
+    )
+
+
+async def _compute_admin_scraper_stats(timezone: str | None) -> AdminScraperStatsResponse:
+    from app.services.dashboard_stats import fetch_admin_dashboard_stats
+    from app.services.weekly_progress import fetch_admin_board_trend_series
+    from app.utils.date_bounds import day_bounds_for_timezone
+
+    day_start, day_end = day_bounds_for_timezone(timezone)
+
+    async with get_session() as session:
+        data = await fetch_admin_dashboard_stats(
+            session,
+            day_start=day_start,
+            day_end=day_end,
+        )
+        trends = await fetch_admin_board_trend_series(
+            session,
+            tz_name=timezone,
+            days=7,
+        )
+        return AdminScraperStatsResponse(
+            total_jobs=data["total_jobs"],
+            total_remote=data["total_remote"],
+            today_fetched=data["today_fetched"],
+            today_scraped=data["today_scraped"],
+            today_remote=data["today_remote"],
+            today_posted=data["today_posted"],
+            extracted_jobs=data["extracted_jobs"],
+            needs_extraction_jobs=data["needs_extraction_jobs"],
+            extraction_failed_jobs=data["extraction_failed_jobs"],
+            extraction_pending_jobs=data["extraction_pending_jobs"],
+            sheet_posted_jobs=data["sheet_posted_jobs"],
+            pumble_posted_jobs=data["pumble_posted_jobs"],
+            manual_jobs=data["manual_jobs"],
+            team_applied_today=data["team_applied_today"],
+            last_sync_items_new=data["last_sync_items_new"],
+            last_sync_items_scraped=data.get("last_sync_items_scraped", 0),
+            last_sync_errors=data["last_sync_errors"],
+            last_sync_at=data.get("last_sync_at"),
+            last_sync_spider=data.get("last_sync_spider"),
+            active_sources=data.get("active_sources", 0),
+            total_users=data.get("total_users", 0),
+            new_users_week=data.get("new_users_week", 0),
+            platform_sync=[
+                PlatformSyncStats(**row) for row in data.get("platform_sync", [])
+            ],
+            trends=AdminBoardTrends(**trends),
+            sources=[
+                SourceStats(
+                    source=row["source"],
+                    count=row["count"],
+                    latest_scraped=row["latest_scraped"],
+                )
+                for row in data["sources"]
+            ],
+            recent_runs=data["recent_runs"],
+        )
+
+
+@scraper_router.get("/sources", response_model=list[str])
+async def list_sources(user=Depends(_get_current_user)):
+    """Distinct source platform names."""
+    from sqlalchemy import text
+
+    async with get_session() as session:
+        result = await session.execute(
+            text("SELECT DISTINCT source FROM scraped_jobs ORDER BY source")
+        )
+        return [row[0] for row in result]
+
+
+@scraper_router.get("/runs", response_model=list[ScrapeRunResponse])
+async def list_scrape_runs(
+    limit: int = Query(20, ge=1, le=100),
+    user=Depends(_get_current_user),
+):
+    """Recent scrape run history."""
+    from sqlalchemy import text
+
+    async with get_session() as session:
+        result = await session.execute(
+            text(
+                "SELECT id, spider_name, started_at, finished_at, items_scraped, "
+                "items_new, items_updated, errors, status "
+                "FROM scrape_runs ORDER BY started_at DESC LIMIT :limit"
+            ),
+            {"limit": limit},
+        )
+        return [ScrapeRunResponse(**dict(row._mapping)) for row in result]
+
+
+@scraper_router.post("/sync", response_model=SyncStatusResponse)
+async def trigger_sync(body: SyncRequest, user=Depends(_get_current_user)):
+    """Queue a spider run via arq. Admin-only."""
+    from app.scraper.runner import check_spider_auth
+    from app.services.scraper_sync_service import build_run_plan
+    from app.tasks.worker import get_scraper_pool
+
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    user_id = user.get("user_id", "")
+
+    from app.services.scraper_stop_service import clear_stop
+
+    await clear_stop()
+
+    try:
+        plan = build_run_plan(
+            spider_name=body.spider_name,
+            spider_names=body.spider_names,
+            sync_mode=body.sync_mode,
+            posted_since=body.posted_since,
+            posted_until=body.posted_until,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    for name, _kwargs in plan:
+        auth_check = check_spider_auth(name)
+        if auth_check["requires_auth"] and not auth_check["ok"]:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Spider '{name}' requires authentication but no session is configured. "
+                    f"Run this command first: {auth_check['auth_setup_command']}"
+                ),
+            )
+
+    spider = body.spider_name
+    if body.spider_names:
+        spider = "all" if len(body.spider_names) > 1 else body.spider_names[0]
+
+    try:
+        pool = await get_scraper_pool()
+        from app.core.redis_support import pipeline_job_id
+        import uuid
+
+        await pool.enqueue_job(
+            "run_scraper_task",
+            spider,
+            str(user_id),
+            sync_mode=body.sync_mode,
+            posted_since=body.posted_since.isoformat() if body.posted_since else None,
+            posted_until=body.posted_until.isoformat() if body.posted_until else None,
+            spider_names=body.spider_names,
+            _job_id=pipeline_job_id(
+                "scrape", spider, str(user_id), uuid.uuid4().hex[:10]
+            ),
+        )
+
+        mode_label = "date-range" if body.sync_mode == "date_backfill" else "incremental"
+        platform_count = len(plan)
+        logger.info(
+            "scraper_sync_enqueued",
+            spider=spider,
+            sync_mode=body.sync_mode,
+            platform_count=platform_count,
+            user_id=str(user_id),
+        )
+        return SyncStatusResponse(
+            status="queued",
+            spider_name=spider,
+            message=(
+                f"{mode_label.capitalize()} sync queued for "
+                f"{platform_count} platform{'s' if platform_count != 1 else ''}."
+            ),
+        )
+    except Exception as e:
+        logger.error("scraper_sync_enqueue_failed", error=str(e))
+        raise HTTPException(status_code=503, detail=f"Failed to queue scraper: {e}")
+
+
+@scraper_router.get("/sync/platforms", response_model=list[SyncPlatformInfo])
+async def list_sync_platforms_endpoint(user=Depends(_get_current_user)):
+    """Platforms available for manual date-range sync."""
+    from app.services.scraper_sync_service import list_sync_platforms
+
+    return [SyncPlatformInfo(**row) for row in list_sync_platforms()]
+
+
+@scraper_router.get("/sync/schedule", response_model=JobSyncScheduleResponse)
+async def get_job_sync_schedule(user=Depends(_get_current_user)):
+    """Admin schedule for automatic platform polling (interval or daily)."""
+    from app.services.job_sync_schedule_service import get_schedule, schedule_public_view
+
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    async with get_session() as session:
+        schedule = await get_schedule(session)
+    return JobSyncScheduleResponse(**schedule_public_view(schedule))
+
+
+@scraper_router.put("/sync/schedule", response_model=JobSyncScheduleResponse)
+async def put_job_sync_schedule(body: JobSyncScheduleUpdate, user=Depends(_get_current_user)):
+    """Save automatic job-sync schedule. Admin-only. Evaluated every minute by the scraper worker."""
+    from app.services.job_sync_schedule_service import save_schedule, schedule_public_view
+    from app.services.scraper_stop_service import clear_stop
+
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    user_id = str(user.get("user_id") or "")
+    if body.enabled:
+        await clear_stop()
+    try:
+        async with get_session() as session:
+            schedule = await save_schedule(
+                session,
+                body.model_dump(),
+                updated_by_user_id=user_id or None,
+            )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    return JobSyncScheduleResponse(**schedule_public_view(schedule))
+
+
+class StopFetchResponse(BaseModel):
+    status: str
+    message: str = ""
+    interrupted_count: int = 0
+    interrupted_run_ids: list[str] = Field(default_factory=list)
+    schedule_disabled: bool = False
+    stop_requested: bool = True
+
+
+@scraper_router.post("/sync/stop", response_model=StopFetchResponse)
+async def stop_job_fetch(user=Depends(_get_current_user)):
+    """Stop in-flight platform scraping and disable scheduled sync. Admin-only."""
+    from app.api.websocket import publish_ws_event
+    from app.services.scraper_stop_service import stop_job_fetching
+
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    user_id = str(user.get("user_id") or "")
+    result = await stop_job_fetching(
+        disable_schedule=True,
+        updated_by_user_id=user_id or None,
+    )
+    await publish_ws_event({
+        "type": "sync_failed",
+        "user_id": user_id,
+        "spider_name": "all",
+        "error": "stopped",
+        "message": result.get("message"),
+    })
+    logger.info(
+        "scraper_sync_stop_requested",
+        user_id=user_id,
+        interrupted_count=result.get("interrupted_count"),
+        schedule_disabled=result.get("schedule_disabled"),
+    )
+    return StopFetchResponse(
+        status=result["status"],
+        message=result["message"],
+        interrupted_count=int(result.get("interrupted_count") or 0),
+        interrupted_run_ids=list(result.get("interrupted_run_ids") or []),
+        schedule_disabled=bool(result.get("schedule_disabled")),
+        stop_requested=True,
+    )
+
+
+@scraper_router.get("/sync/checkpoints", response_model=list[SyncCheckpointInfo])
+async def list_sync_checkpoints(user=Depends(_get_current_user)):
+    """Latest checkpoint marker job IDs saved after each spider run."""
+    from sqlalchemy import text
+
+    async with get_session() as session:
+        result = await session.execute(
+            text(
+                "SELECT spider_name, marker_job_ids, updated_at "
+                "FROM scrape_checkpoints ORDER BY spider_name"
+            )
+        )
+        rows = result.mappings().all()
+
+    checkpoints: list[SyncCheckpointInfo] = []
+    for row in rows:
+        raw = row["marker_job_ids"]
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        checkpoints.append(
+            SyncCheckpointInfo(
+                spider_name=row["spider_name"],
+                marker_job_ids=raw,
+                updated_at=row.get("updated_at"),
+            )
+        )
+    return checkpoints
+
+
+@scraper_router.get("/sync/status", response_model=SyncStatusResponse)
+async def get_sync_status(user=Depends(_get_current_user)):
+    """Check if any spider is currently running.
+
+    Any run that has been in 'running' state for longer than the worker's
+    subprocess timeout (1800 s / 30 min) is treated as stale - it is
+    marked 'interrupted' inline and the endpoint returns 'idle'.  This is
+    the belt-and-suspenders guard for the case where the startup cleanup
+    in lifespan() was skipped (e.g. the worker process crashed without
+    the API server restarting).
+    """
+    from sqlalchemy import text
+
+    # Worker timeout is 1800 s; add a small buffer → 31 min.
+    # Threshold is inlined as a literal - asyncpg cannot bind parameters
+    # inside PostgreSQL INTERVAL strings.
+    # The threshold is a hard-coded constant so it can be inlined directly
+    # into the SQL string - PostgreSQL does not support bind parameters
+    # inside INTERVAL literals (e.g. INTERVAL '$1 minutes' is invalid).
+    async with get_session() as session:
+        # Auto-heal runs that have been stuck for too long.
+        await session.execute(
+            text(
+                "UPDATE scrape_runs "
+                "SET status = 'interrupted', finished_at = now() "
+                "WHERE status = 'running' "
+                "  AND started_at < now() - INTERVAL '31 minutes'"
+            )
+        )
+        await session.commit()
+
+        result = await session.execute(
+            text(
+                "SELECT spider_name, items_scraped, items_new, items_updated, started_at "
+                "FROM scrape_runs WHERE status = 'running' "
+                "ORDER BY started_at DESC LIMIT 1"
+            )
+        )
+        row = result.mappings().first()
+        if row:
+            started_at = row.get("started_at")
+            elapsed = None
+            if started_at is not None:
+                from datetime import timezone as tz
+                now = datetime.now(tz.utc).replace(tzinfo=None)
+                if getattr(started_at, "tzinfo", None) is not None:
+                    started_at = started_at.astimezone(tz.utc).replace(tzinfo=None)
+                elapsed = max(0, int((now - started_at).total_seconds()))
+            items_scraped = int(row.get("items_scraped") or 0)
+            items_new = int(row.get("items_new") or 0)
+            items_updated = int(row.get("items_updated") or 0)
+            spider = row["spider_name"]
+            return SyncStatusResponse(
+                status="running",
+                spider_name=spider,
+                items_scraped=items_scraped,
+                items_new=items_new,
+                items_updated=items_updated,
+                started_at=started_at,
+                elapsed_seconds=elapsed,
+                message=_sync_running_message(spider, items_scraped, elapsed),
+            )
+        return SyncStatusResponse(status="idle", message="No spider is currently running.")
+
+
+@scraper_router.get("/spiders", response_model=list[SpiderInfo])
+async def list_spiders(user=Depends(_get_current_user)):
+    """Available spiders with metadata including live auth status."""
+    from app.scraper.runner import get_available_spiders
+
+    spiders = get_available_spiders()
+    return [SpiderInfo(**s) for s in spiders]
+
+
+@scraper_router.post("/jobs/{job_id}/rerun-extraction", response_model=RerunResponse)
+async def rerun_scraped_job_extraction(
+    job_id: str,
+    user=Depends(_get_current_user),
+):
+    """Rerun the description-extraction pipeline for a scraped job.
+
+    Behavior:
+    - If the row was never promoted: promote it now (creates JobExtraction +
+      Job via the same path used after a fresh scrape) and enqueue
+      ``extract_job``.
+    - If the row was already promoted: clear the linked JobExtraction's
+      structured fields via ``reset_for_refresh`` so the next pass writes a
+      fresh result, then enqueue ``extract_job`` against the latest URL.
+    """
+    from sqlalchemy import text
+
+    async with get_session() as session:
+        row = (await session.execute(
+            text("SELECT * FROM scraped_jobs WHERE id = :id"),
+            {"id": job_id},
+        )).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scraped job not found")
+
+    user_id: str | None = user.get("user_id") if isinstance(user, dict) else None
+    result = await _rerun_scraped_job_lifecycle(dict(row), user_id=user_id)
+    if result.status == "enqueued":
+        return result
+    _raise_http_for_rerun_failure(result)
+
+
+@scraper_router.patch("/jobs/{job_id}", response_model=ScrapedJobResponse)
+async def update_scraped_job(
+    job_id: str,
+    body: ScrapedJobUpdateRequest,
+    user=Depends(_get_current_user),
+):
+    """Edit an existing scraped job.
+
+    When the URL changes, the linked JobExtraction + Job are kept in
+    sync (source_url, normalized_url, domain).  The caller can hit
+    ``POST /scraper/jobs/{id}/rerun-extraction`` afterwards to refresh the
+    extraction body against the new URL.
+    """
+    from sqlalchemy import text
+    from app.services.url_manager import URLManager
+
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields supplied to update")
+
+    for url_field in ("url", "origin_url"):
+        if url_field in updates:
+            candidate = (updates[url_field] or "").strip()
+            if candidate:
+                ok, err = URLManager.validate_url(candidate)
+                if not ok:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{url_field} is invalid: {err or 'unknown error'}",
+                    )
+                updates[url_field] = candidate
+            else:
+                updates[url_field] = None
+
+    async with get_session() as session:
+        row = (await session.execute(
+            text("SELECT * FROM scraped_jobs WHERE id = :id"),
+            {"id": job_id},
+        )).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scraped job not found")
+        existing = dict(row)
+
+        set_clauses = []
+        params: dict = {"id": job_id, "now": datetime.now(timezone.utc).replace(tzinfo=None)}
+        for col in ("url", "origin_url", "title", "company_name", "location"):
+            if col in updates:
+                set_clauses.append(f"{col} = :{col}")
+                params[col] = updates[col]
+        set_clauses.append("updated_at = :now")
+        await session.execute(
+            text(f"UPDATE scraped_jobs SET {', '.join(set_clauses)} WHERE id = :id"),
+            params,
+        )
+
+        # Propagate URL changes to the linked JobExtraction + Job so
+        # rerunning extraction uses the updated URL.
+        if "url" in updates or "origin_url" in updates:
+            new_existing = dict(existing)
+            if "url" in updates:
+                new_existing["url"] = updates["url"]
+            if "origin_url" in updates:
+                new_existing["origin_url"] = updates["origin_url"]
+            from app.services.scrape_promoter import pick_target_url
+            new_target = pick_target_url(new_existing)
+            promoted_extraction_id = existing.get("promoted_extraction_id")
+            if new_target and promoted_extraction_id:
+                domain = URLManager.extract_domain(new_target)
+                await session.execute(
+                    text(
+                        "UPDATE job_extractions "
+                        "SET source_url = :u, normalized_url = :u, domain = :d, updated_at = :now "
+                        "WHERE id = :eid"
+                    ),
+                    {"u": new_target, "d": domain, "now": params["now"], "eid": promoted_extraction_id},
+                )
+                await session.execute(
+                    text(
+                        "UPDATE jobs "
+                        "SET source_url = :u, normalized_url = :u, domain = :d, updated_at = :now "
+                        "WHERE extraction_id = :eid"
+                    ),
+                    {"u": new_target, "d": domain, "now": params["now"], "eid": promoted_extraction_id},
+                )
+
+        # The get_session() context manager commits on exit; flush so the
+        # refresh SELECT below sees the in-flight UPDATE without needing a
+        # second explicit commit (which on Windows + asyncpg was causing a
+        # hang during the implicit context-exit commit).
+        await session.flush()
+
+        refreshed = (await session.execute(
+            text("SELECT * FROM scraped_jobs WHERE id = :id"),
+            {"id": job_id},
+        )).mappings().first()
+        response = ScrapedJobResponse(**dict(refreshed))
+
+    return response
+
+
+@scraper_router.delete("/jobs/{job_id}", response_model=DeleteResponse)
+async def delete_scraped_job(job_id: str, user=Depends(_get_current_user)):
+    """Delete a scraped job row.
+
+    The linked JobExtraction and Job (if any) are left untouched so
+    extraction history and downstream analyses are preserved.  The user can
+    delete those independently from the Extraction Dashboard.
+    """
+    from sqlalchemy import text
+
+    async with get_session() as session:
+        row = (await session.execute(
+            text("SELECT id FROM scraped_jobs WHERE id = :id"),
+            {"id": job_id},
+        )).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scraped job not found")
+        await session.execute(
+            text("DELETE FROM scraped_jobs WHERE id = :id"),
+            {"id": job_id},
+        )
+        await session.commit()
+
+    logger.info("scraped_job_deleted", scraped_job_id=job_id)
+    return DeleteResponse(
+        status="deleted",
+        scraped_job_id=job_id,
+        message="Scraped job removed. The linked extraction (if any) is preserved.",
+    )
+
+
+@scraper_router.get("/auth/status", response_model=list[AuthPlatformStatus])
+async def get_auth_status(
+    platform: Optional[str] = Query(None),
+    user=Depends(_get_current_user),
+):
+    """Check authentication session status for scraper platforms."""
+    from app.scraper.auth import PLATFORMS, session_status
+
+    results = []
+    platforms_to_check = {platform: PLATFORMS[platform]} if platform and platform in PLATFORMS else PLATFORMS
+
+    for key, cfg in platforms_to_check.items():
+        status = session_status(key)
+        results.append(AuthPlatformStatus(
+            platform=key,
+            label=cfg["label"],
+            exists=status.get("exists", False),
+            corrupt=status.get("corrupt", False),
+            saved_at=status.get("saved_at"),
+            cookie_count=status.get("cookie_count", 0),
+            setup_command=f"python -m app.scraper.auth capture {key}",
+            token_expired=status.get("token_expired"),
+            token_expires_at=status.get("token_expires_at"),
+        ))
+
+    return results
+
+
+@scraper_router.post("/auth/clear/{platform}")
+async def clear_auth_session(platform: str, user=Depends(_get_current_user)):
+    """Clear a saved authentication session for a platform."""
+    from app.scraper.auth import PLATFORMS, clear_session
+
+    if platform not in PLATFORMS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown platform: {platform}. Supported: {', '.join(PLATFORMS.keys())}",
+        )
+
+    cleared = clear_session(platform)
+    if cleared:
+        return {"status": "cleared", "platform": platform, "message": f"Session for {platform} has been cleared."}
+    return {"status": "not_found", "platform": platform, "message": f"No session file found for {platform}."}

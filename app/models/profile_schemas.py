@@ -1,0 +1,415 @@
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from datetime import datetime
+import re
+
+from app.models.resume_design_schemas import PHOTO_MAX_CHARS, check_photo_data_url
+
+
+# ---- Nested schemas ----
+
+class TechnicalSkillBlock(BaseModel):
+    category: str = Field(..., min_length=1, max_length=100)
+    skills: str = Field(..., max_length=2000)
+
+
+def _empty_to_none(v: str | None) -> str | None:
+    return None if (v is None or (isinstance(v, str) and not v.strip())) else v
+
+
+def _coerce_str_list(v) -> list[str]:
+    """Normalize a value into a clean list of non-empty strings.
+
+    Accepts a list (filtering blanks) or a newline-separated string so legacy
+    single-blob inputs degrade gracefully into a structured list.
+    """
+    if v is None:
+        return []
+    if isinstance(v, str):
+        items = [ln.strip() for ln in v.splitlines()]
+        return [s for s in items if s]
+    if isinstance(v, (list, tuple)):
+        out: list[str] = []
+        for item in v:
+            if item is None:
+                continue
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return out
+    return []
+
+
+class WorkExperienceBlock(BaseModel):
+    company_name: str = Field(..., min_length=1, max_length=200)
+    job_title: str = Field(..., min_length=1, max_length=200)
+    period_start: str | None = Field(default=None, max_length=20)
+    period_end: str | None = Field(default=None, max_length=20)
+    location: str | None = Field(default=None, max_length=200)
+    job_type: str | None = Field(default=None, max_length=20)  # onsite, hybrid, remote
+    employment_type: str | None = Field(default=None, max_length=40)  # full-time, internship, contract, part-time
+    project_title: str | None = Field(default=None, max_length=300)
+    project_intro: str | None = Field(default=None, max_length=2000)
+    contributions: list[str] = Field(default_factory=list, max_length=40)
+    used_skills: str | None = Field(default=None, max_length=2000)
+    description: str | None = Field(default=None, max_length=12000)
+
+    @field_validator(
+        "period_start", "period_end", "location", "job_type", "employment_type",
+        "project_title", "project_intro", "used_skills", "description", mode="before",
+    )
+    @classmethod
+    def empty_to_none(cls, v):
+        return _empty_to_none(v)
+
+    @field_validator("contributions", mode="before")
+    @classmethod
+    def normalize_contributions(cls, v):
+        return _coerce_str_list(v)
+
+
+class EducationBlock(BaseModel):
+    university_name: str = Field(..., min_length=1, max_length=200)
+    degree: str = Field(..., min_length=1, max_length=200)
+    mark: str | None = Field(default=None, max_length=100)
+    period_start: str | None = Field(default=None, max_length=20)
+    period_end: str | None = Field(default=None, max_length=20)
+    location: str | None = Field(default=None, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    # Optional major / FoS for Workday Field of Study prompts. When blank the
+    # autofill profile falls back to settings.autofill_default_field_of_study.
+    field_of_study: str | None = Field(default=None, max_length=200)
+
+    @field_validator(
+        "mark",
+        "period_start",
+        "period_end",
+        "location",
+        "description",
+        "field_of_study",
+        mode="before",
+    )
+    @classmethod
+    def empty_to_none(cls, v):
+        return _empty_to_none(v)
+
+
+class CertificateBlock(BaseModel):
+    name: str = Field(..., min_length=1, max_length=300)
+    issued_at: str | None = Field(default=None, max_length=40)
+    url: str | None = Field(default=None, max_length=500)
+
+    @field_validator("issued_at", "url", mode="before")
+    @classmethod
+    def empty_optional(cls, v):
+        return _empty_to_none(v)
+
+
+class EEOPreferences(BaseModel):
+    """Voluntary EEO / demographic answers. Strings empty -> None; yes/no fields
+    are tri-state booleans (None = unspecified, engine uses its default)."""
+    gender: str | None = Field(default=None, max_length=50)
+    race: str | None = Field(default=None, max_length=100)
+    sexual_orientation: str | None = Field(default=None, max_length=120)
+    hispanic_latino: bool | None = None
+    veteran_status: bool | None = None
+    disability_status: bool | None = None
+    work_authorized: bool | None = None
+    needs_sponsorship: bool | None = None
+
+    @field_validator("gender", "race", "sexual_orientation", mode="before")
+    @classmethod
+    def empty_to_none(cls, v):
+        return _empty_to_none(v)
+
+
+class AddressInfo(BaseModel):
+    """Legal / home address for application autofill, plus job location prefs."""
+    line1: str | None = Field(default=None, max_length=200)
+    line2: str | None = Field(default=None, max_length=200)
+    city: str | None = Field(default=None, max_length=120)
+    state: str | None = Field(default=None, max_length=120)
+    postal_code: str | None = Field(default=None, max_length=20)
+    country: str | None = Field(default=None, max_length=120)
+    # Preferred job locales / regions (e.g. "Bay Area", "Remote US", "Seattle").
+    local_preferences: list[str] = Field(default_factory=list)
+
+    @field_validator("line1", "line2", "city", "state", "postal_code", "country", mode="before")
+    @classmethod
+    def empty_to_none(cls, v):
+        return _empty_to_none(v)
+
+    @field_validator("local_preferences", mode="before")
+    @classmethod
+    def normalize_local_preferences(cls, v):
+        if v is None:
+            return []
+        if not isinstance(v, list):
+            raise ValueError("local_preferences must be a list of strings")
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in v:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if not text:
+                continue
+            if len(text) > 120:
+                text = text[:120]
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text)
+            if len(cleaned) >= 30:
+                break
+        return cleaned
+
+
+# ---- Validation helpers ----
+
+def _email_valid(v: str) -> str:
+    if not v or "@" not in v or "." not in v:
+        raise ValueError("Invalid email format")
+    return v.lower().strip()
+
+
+def _linkedin_valid(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        raise ValueError("LinkedIn URL is required")
+    if "linkedin.com/in/" not in v.lower():
+        raise ValueError("Invalid LinkedIn URL (expected linkedin.com/in/...)")
+    return v
+
+
+def _github_valid(v: str | None) -> str | None:
+    if not v or not v.strip():
+        return None
+    v = v.strip()
+    if "github.com/" not in v.lower():
+        raise ValueError("Invalid GitHub URL (expected github.com/...)")
+    return v
+
+
+def _phone_valid(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        raise ValueError("Phone number is required")
+    if not re.match(r"^[\d\s\-+()]{7,30}$", v):
+        raise ValueError("Invalid phone number format")
+    digits = re.sub(r"\D", "", v)
+    if len(digits) < 8 or len(digits) > 15:
+        raise ValueError("Phone number must include 8–15 digits (US/Canada: 10 digits)")
+    return v
+
+
+# ---- Request schemas ----
+
+# ---- Resume import (loose extraction; validated again on profile save) ----
+
+
+class ResumeSkillBlock(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    category: str | None = None
+    skills: str | None = None
+
+
+class ResumeWorkBlock(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    company_name: str | None = None
+    job_title: str | None = None
+    period_start: str | None = None
+    period_end: str | None = None
+    location: str | None = None
+    job_type: str | None = None
+    employment_type: str | None = None
+    project_title: str | None = None
+    project_intro: str | None = None
+    contributions: list[str] = Field(default_factory=list)
+    used_skills: str | None = None
+    description: str | None = None
+
+    @field_validator("contributions", mode="before")
+    @classmethod
+    def normalize_contributions(cls, v):
+        return _coerce_str_list(v)
+
+
+class ResumeEducationBlock(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    university_name: str | None = None
+    degree: str | None = None
+    mark: str | None = None
+    period_start: str | None = None
+    period_end: str | None = None
+    location: str | None = None
+    description: str | None = None
+    field_of_study: str | None = None
+
+
+class ResumeCertBlock(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str | None = None
+    issued_at: str | None = None
+    url: str | None = None
+
+
+class ResumeExtractedDraft(BaseModel):
+    """Structured profile fields extracted from a résumé (all optional)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    name_first: str | None = None
+    name_middle: str | None = None
+    name_last: str | None = None
+    title: str | None = None
+    email: str | None = None
+    phone_country_code: str | None = None
+    phone_number: str | None = None
+    linkedin_url: str | None = None
+    github_url: str | None = None
+    profile_summary: str | None = None
+    location: str | None = None
+    address: AddressInfo | None = None
+    technical_skills: list[ResumeSkillBlock] = Field(default_factory=list)
+    work_experience: list[ResumeWorkBlock] = Field(default_factory=list)
+    education: list[ResumeEducationBlock] = Field(default_factory=list)
+    certificates: list[ResumeCertBlock] = Field(default_factory=list)
+    extra: list[str] = Field(default_factory=list)
+
+    @field_validator("extra", mode="before")
+    @classmethod
+    def normalize_extra(cls, v):
+        return _coerce_str_list(v)
+
+    @field_validator("location", mode="before")
+    @classmethod
+    def empty_location(cls, v):
+        return _empty_to_none(v)
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def coerce_address(cls, v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, str):
+            from app.services.resume_location import parse_resume_header_location
+
+            parsed = parse_resume_header_location(v)
+            return parsed or None
+        return v
+
+
+class ResumeParseResponse(BaseModel):
+    draft: ResumeExtractedDraft
+    source_kind: str
+    warnings: list[str] = Field(default_factory=list)
+    # Countries auto-detected from the resume (ISO alpha-2). Applied to the
+    # user's country preferences unless they configured them manually.
+    detected_countries: list[str] = Field(default_factory=list)
+    country_preferences_applied: bool = False
+
+
+class ProfileCreateRequest(BaseModel):
+    name_first: str = Field(..., min_length=1, max_length=100)
+    name_middle: str | None = Field(default=None, max_length=100)
+    name_last: str = Field(..., min_length=1, max_length=100)
+    title: str = Field(..., min_length=1, max_length=200)
+    email: str = Field(..., min_length=5, max_length=255)
+    phone_country_code: str = Field(..., min_length=1, max_length=10)
+    phone_number: str = Field(..., min_length=7, max_length=30)
+    linkedin_url: str = Field(..., min_length=10, max_length=500)
+    github_url: str | None = Field(default=None, max_length=500)
+    profile_summary: str = Field(..., min_length=1, max_length=5000)
+    technical_skills: list[TechnicalSkillBlock] = Field(default_factory=list)
+    work_experience: list[WorkExperienceBlock] = Field(default_factory=list)
+    education: list[EducationBlock] = Field(default_factory=list)
+    certificates: list[CertificateBlock] = Field(default_factory=list)
+    extra: list[str] = Field(default_factory=list)
+    eeo_preferences: EEOPreferences = Field(default_factory=EEOPreferences)
+    address: AddressInfo = Field(default_factory=AddressInfo)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        return _email_valid(v)
+
+    @field_validator("linkedin_url")
+    @classmethod
+    def validate_linkedin(cls, v: str) -> str:
+        return _linkedin_valid(v)
+
+    @field_validator("github_url")
+    @classmethod
+    def validate_github(cls, v: str | None) -> str | None:
+        return _github_valid(v)
+
+    @field_validator("name_middle", mode="before")
+    @classmethod
+    def empty_middle_to_none(cls, v):
+        return _empty_to_none(v)
+
+    @field_validator("phone_number")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        return _phone_valid(v)
+
+    @model_validator(mode="after")
+    def validate_phone_with_country(self):
+        cc_digits = re.sub(r"\D", "", self.phone_country_code or "")
+        num_digits = re.sub(r"\D", "", self.phone_number or "")
+        if cc_digits == "1" and len(num_digits) != 10:
+            raise ValueError(
+                "US/Canada phone numbers must be 10 digits (area code + number), "
+                "e.g. (610) 234-7936, incomplete values like 313-3369 are not allowed"
+            )
+        return self
+
+
+# Alias: single profile uses same schema for create/update
+ProfileUpdateRequest = ProfileCreateRequest
+
+
+# ---- Response schema (single profile per user) ----
+
+class ProfileResponse(BaseModel):
+    user_id: str
+    name: str
+    name_first: str | None = None
+    name_middle: str | None = None
+    name_last: str | None = None
+    title: str | None = None
+    email: str | None = None
+    phone_country_code: str | None = None
+    phone_number: str | None = None
+    linkedin_url: str | None = None
+    github_url: str | None = None
+    profile_summary: str | None = None
+    technical_skills: list[dict] = Field(default_factory=list)
+    work_experience: list[dict] = Field(default_factory=list)
+    education: list[dict] = Field(default_factory=list)
+    certificates: list[dict] = Field(default_factory=list)
+    extra: list[str] = Field(default_factory=list)
+    eeo_preferences: dict = Field(default_factory=dict)
+    address: dict = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProfilePhotoRequest(BaseModel):
+    """Square headshot, already cropped and compressed by the browser."""
+
+    data_url: str = Field(..., min_length=1, max_length=PHOTO_MAX_CHARS)
+
+    @field_validator("data_url")
+    @classmethod
+    def _image_data_url(cls, v: str) -> str:
+        return check_photo_data_url(v)
+
+
+class ProfilePhotoResponse(BaseModel):
+    photo: str | None = None

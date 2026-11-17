@@ -1,0 +1,720 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Link } from 'react-router-dom';
+import {
+  AlertCircle,
+  ChevronDown,
+  ClipboardCheck,
+  Download,
+  FileText,
+  FileType2,
+  LayoutTemplate,
+  Loader2,
+  Mail,
+  Minus,
+  Palette,
+  PenLine,
+  Plus,
+  Rows3,
+  ScanEye,
+  SlidersHorizontal,
+  Type,
+} from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { PageTitle } from '@/components/app/PageTitle';
+import { cn } from '@/lib/utils';
+import { BrandedLoader } from '@/components/layout/BrandedLoader';
+import { ThemeGallery } from '@/components/resumeBuilder/ThemeGallery';
+import { FontPicker } from '@/components/resumeBuilder/FontPicker';
+import { ColorControls } from '@/components/resumeBuilder/ColorControls';
+import { FormatControls } from '@/components/resumeBuilder/FormatControls';
+import { HeaderControls } from '@/components/resumeBuilder/HeaderControls';
+import { HeaderImageControls } from '@/components/resumeBuilder/HeaderImageControls';
+import { PhotoControls } from '@/components/resumeBuilder/PhotoControls';
+import { SectionDetails } from '@/components/resumeBuilder/SectionDetails';
+import { SectionManager } from '@/components/resumeBuilder/SectionManager';
+import { ContentControls } from '@/components/resumeBuilder/ContentControls';
+import { DateControls } from '@/components/resumeBuilder/DateControls';
+import { ExtraSectionsEditor } from '@/components/resumeBuilder/ExtraSectionsEditor';
+import { HeadingControls } from '@/components/resumeBuilder/HeadingControls';
+import { ResumeReview, tightenDesign, type FitState } from '@/components/resumeBuilder/ResumeReview';
+import { Toolbar } from '@/components/resumeBuilder/Toolbar';
+import { ControlCard } from '@/components/resumeBuilder/controls';
+import { PAPER_SIZES, ResumePageStack, paperOf } from '@/components/resumeBuilder/PagedResumePreview';
+import type { CoverLetterBody } from '@/components/resumeBuilder/ResumePreview';
+import { selectIsDirty, useResumeBuilderStore } from '@/stores/resumeBuilderStore';
+import { useMediaQuery } from '@/hooks/useMediaQuery';
+import { useProfilePhoto } from '@/hooks/useProfilePhoto';
+import { effectiveProfile, normalizeResumeContent, profileToContent, seedHeaderLocation } from '@/utils/resumeContent';
+import {
+  fetchLibraryCoverLetter,
+  renderDesign,
+  saveFile,
+  saveLibraryCoverLetter,
+} from '@/api/documentsApi';
+import type { PaperSize, ResumeDesign } from '@/types/resumeDesign';
+import { StudioAiChat, StudioAiChatToggle } from './StudioAiChat';
+
+type Tab = 'style' | 'format' | 'sections' | 'content' | 'review';
+type DocKind = 'resume' | 'letter';
+const AI_OPEN_KEY = 'nao.studio.aiOpen';
+const FIT_STEP_MS = 260;
+const FIT_MAX_STEPS = 40;
+
+const TABS: { id: Tab; label: string; icon: typeof Palette }[] = [
+  { id: 'style', label: 'Style', icon: Palette },
+  { id: 'format', label: 'Format', icon: Type },
+  { id: 'sections', label: 'Sections', icon: Rows3 },
+  { id: 'content', label: 'Content', icon: PenLine },
+  { id: 'review', label: 'Review', icon: ClipboardCheck },
+];
+
+const ZOOM_STEPS = [0.3, 0.4, 0.5, 0.67, 0.75, 0.85, 1, 1.1, 1.25, 1.5, 1.75, 2];
+const CANVAS_PAD = 48;
+const LETTER_SAVE_DEBOUNCE_MS = 700;
+
+function letterParagraphs(body: string): string[] {
+  return body
+    .replace(/\r\n/g, '\n')
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+}
+
+function errorText(err: unknown, fallback: string): string {
+  const e = err as { response?: { data?: { detail?: string } } };
+  return e?.response?.data?.detail || fallback;
+}
+
+/** Resume studio: style and edit the active resume on live pages. What you see is
+ *  what the PDF gets: the server prints these same page components in Chromium. */
+export function ResumeStudioPage() {
+  const store = useResumeBuilderStore();
+  const dirty = useResumeBuilderStore(selectIsDirty);
+  const [tab, setTab] = useState<Tab>(() =>
+    useResumeBuilderStore.getState().panelTab === 'content' ? 'content' : 'style',
+  );
+  const [mobileView, setMobileView] = useState<'edit' | 'preview'>('preview');
+  const isDesktop = useMediaQuery('(min-width: 1024px)');
+  const parkPreview = !isDesktop && mobileView === 'edit';
+  const [doc, setDoc] = useState<DocKind>('resume');
+  const [zoom, setZoom] = useState<number | 'fit'>('fit');
+  const [fitScale, setFitScale] = useState(1);
+  const [pageCount, setPageCount] = useState(1);
+  const [exporting, setExporting] = useState<'pdf' | 'docx' | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [letter, setLetter] = useState<string | null>(null);
+  const [letterSaving, setLetterSaving] = useState(false);
+  const [canvasEl, setCanvasEl] = useState<HTMLDivElement | null>(null);
+  const letterTimer = useRef<number | null>(null);
+  const [fit, setFit] = useState<FitState>(null);
+  const fitUndo = useRef<ResumeDesign | null>(null);
+  const fitTimer = useRef<number | null>(null);
+  const pageCountRef = useRef(pageCount);
+  pageCountRef.current = pageCount;
+  const [aiOpen, setAiOpen] = useState(() => {
+    try {
+      return sessionStorage.getItem(AI_OPEN_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    void store.load();
+    return () => {
+      if (fitTimer.current) window.clearTimeout(fitTimer.current);
+      // Fire-and-forget on unmount; React will not await cleanup. Rebuild docs and
+      // resume switches await flushAutoSave so pending style edits are not lost.
+      void useResumeBuilderStore.getState().flushAutoSave();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** Tighten spacing, then margins, then text size, one step per repagination. */
+  const fitToPages = (target: 1 | 2) => {
+    const s = useResumeBuilderStore.getState();
+    if (!s.design) return;
+    if (fitTimer.current) window.clearTimeout(fitTimer.current);
+    setDoc('resume');
+    fitUndo.current = s.design;
+    setFit({ target, status: 'running' });
+    let steps = 0;
+    const tick = () => {
+      fitTimer.current = null;
+      if (pageCountRef.current <= target) {
+        setFit({ target, status: 'done' });
+        return;
+      }
+      const current = useResumeBuilderStore.getState().design;
+      const next = current && steps < FIT_MAX_STEPS ? tightenDesign(current) : null;
+      if (!next) {
+        setFit({ target, status: 'stuck' });
+        return;
+      }
+      steps += 1;
+      useResumeBuilderStore.getState().updateDesign(() => next);
+      fitTimer.current = window.setTimeout(tick, FIT_STEP_MS);
+    };
+    // The cover letter may be on screen; let the resume paginate before measuring.
+    if (doc === 'letter') fitTimer.current = window.setTimeout(tick, FIT_STEP_MS);
+    else tick();
+  };
+
+  const undoFit = () => {
+    const before = fitUndo.current;
+    if (before) store.updateDesign(() => before);
+    fitUndo.current = null;
+    setFit(null);
+  };
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(AI_OPEN_KEY, aiOpen ? '1' : '0');
+    } catch {
+      // ignore
+    }
+  }, [aiOpen]);
+
+  // When AI applies tailored content it jumps the store to the Content tab.
+  useEffect(() => {
+    if (store.panelTab === 'content') setTab('content');
+  }, [store.panelTab]);
+
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      const s = useResumeBuilderStore.getState();
+      if (!selectIsDirty(s)) return;
+      void s.flushAutoSave();
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, []);
+
+  // The active library resume may carry a cover letter generated with it.
+  const activeId = store.activeResumeId;
+  useEffect(() => {
+    setLetter(null);
+    setDoc('resume');
+    if (!activeId) return;
+    let alive = true;
+    fetchLibraryCoverLetter(activeId)
+      .then((body) => {
+        if (alive) setLetter(body);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [activeId]);
+
+  const design = store.design;
+  const profilePhoto = useProfilePhoto();
+  const paper: PaperSize = design ? paperOf(design) : 'letter';
+  const nativeW = PAPER_SIZES[paper].widthPx;
+
+  useEffect(() => {
+    if (!canvasEl) return;
+    const ro = new ResizeObserver(([entry]) => {
+      const w = entry.contentRect.width - CANVAS_PAD;
+      if (w > 0) setFitScale(Math.max(0.3, Math.min(1.25, w / nativeW)));
+    });
+    ro.observe(canvasEl);
+    return () => ro.disconnect();
+  }, [canvasEl, nativeW]);
+
+  const scale = zoom === 'fit' ? fitScale : zoom;
+  const stepZoom = (dir: 1 | -1) => {
+    const cur = scale;
+    const next =
+      dir > 0 ? ZOOM_STEPS.find((z) => z > cur + 0.001) : [...ZOOM_STEPS].reverse().find((z) => z < cur - 0.001);
+    if (next) setZoom(next);
+  };
+
+  const canZoomOut = scale > ZOOM_STEPS[0] + 0.001;
+  const canZoomIn = scale < ZOOM_STEPS[ZOOM_STEPS.length - 1] - 0.001;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === '=' || e.key === '+') {
+        e.preventDefault();
+        stepZoom(1);
+      } else if (e.key === '-') {
+        e.preventDefault();
+        stepZoom(-1);
+      } else if (e.key === '0') {
+        e.preventDefault();
+        setZoom('fit');
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  const onLetterChange = (value: string) => {
+    setLetter(value);
+    if (!activeId) return;
+    if (letterTimer.current) window.clearTimeout(letterTimer.current);
+    letterTimer.current = window.setTimeout(() => {
+      setLetterSaving(true);
+      saveLibraryCoverLetter(activeId, value)
+        .catch(() => undefined)
+        .finally(() => setLetterSaving(false));
+    }, LETTER_SAVE_DEBOUNCE_MS);
+  };
+
+  const letterBody: CoverLetterBody | null = useMemo(
+    () => (doc === 'letter' && letter ? { title: 'Cover Letter', paragraphs: letterParagraphs(letter) } : null),
+    [doc, letter],
+  );
+
+  const exportAs = useCallback(
+    async (kind: 'pdf' | 'docx') => {
+      if (!design || exporting) return;
+      setExporting(kind);
+      setExportError(null);
+      try {
+        const { file } = await renderDesign(design, kind, { coverLetter: doc === 'letter' ? letter : null });
+        saveFile(file);
+      } catch (err) {
+        setExportError(errorText(err, kind === 'pdf' ? 'Could not create the PDF.' : 'Could not create the Word file.'));
+      } finally {
+        setExporting(null);
+      }
+    },
+    [design, exporting, doc, letter],
+  );
+
+  if (store.loading || !design || !store.catalog) {
+    return (
+      <div className="h-full">
+        <PageTitle title="Resume studio" />
+        <BrandedLoader label={store.error ?? 'Opening the studio…'} />
+      </div>
+    );
+  }
+
+  const { catalog, profile } = store;
+  const previewProfile = effectiveProfile(profile, design.content);
+  const activeResume = store.resumes.find((r) => r.id === store.activeResumeId) ?? null;
+  const hasLetter = Boolean(letter && letter.trim());
+
+  const panels: Record<Tab, ReactNode> = {
+    style: (
+      <>
+        <ThemeGallery themes={catalog.themes} design={design} onApply={store.applyTheme} />
+        <ColorControls
+          design={design}
+          presets={catalog.color_presets}
+          onChange={store.updateColors}
+          onApplyPreset={store.applyColorPreset}
+        />
+        <FontPicker design={design} fonts={catalog.fonts} onChange={store.updateTypography} />
+      </>
+    ),
+    format: (
+      <>
+        <HeadingControls
+          design={design}
+          fonts={catalog.fonts}
+          onTypography={store.updateTypography}
+          onLayout={store.updateLayout}
+        />
+        <FormatControls
+          design={design}
+          onTypography={store.updateTypography}
+          onLayout={store.updateLayout}
+          onDesign={store.updateDesign}
+        />
+        <HeaderControls design={design} onLayout={store.updateLayout} />
+        {design.layout.header_background === 'image' && (
+          <HeaderImageControls design={design} image={design.layout.header_image} onChange={store.setHeaderImage} />
+        )}
+        <PhotoControls photo={design.layout.photo} profilePhoto={profilePhoto.data} onChange={store.setPhoto} />
+      </>
+    ),
+    sections: (
+      <>
+        <SectionManager
+          design={design}
+          onToggle={store.toggleSection}
+          onMove={store.moveSection}
+          onRename={store.setSectionTitle}
+          onAdd={(kind) => {
+            if (store.addExtraSection(kind)) setTab('content');
+          }}
+          onRemove={store.removeExtraSection}
+        />
+        <DateControls design={design} onSections={store.updateSectionOptions} />
+        <SectionDetails
+          design={design}
+          onSections={store.updateSectionOptions}
+          onSkills={store.applySkillsStyle}
+          onExperience={store.updateExperienceStyle}
+          onEducation={store.updateEducationStyle}
+          onCertificates={store.updateCertificatesStyle}
+        />
+      </>
+    ),
+    content:
+      doc === 'letter' ? (
+        <ControlCard icon={Mail} title="Cover letter">
+          <p className="text-xs text-muted-foreground">
+            Separate paragraphs with a blank line. The letter uses this resume&apos;s letterhead and theme.
+          </p>
+          <Textarea
+            value={letter ?? ''}
+            onChange={(e) => onLetterChange(e.target.value)}
+            className="min-h-[28rem] text-sm leading-relaxed"
+            aria-label="Cover letter text"
+          />
+          <p className="text-[11px] text-muted-foreground">{letterSaving ? 'Saving…' : 'Changes save automatically.'}</p>
+        </ControlCard>
+      ) : (
+        <ContentControls
+          content={seedHeaderLocation(
+            design.content ? normalizeResumeContent(design.content) : profileToContent(profile),
+            profile,
+          )}
+          onChange={store.setContent}
+          extra={
+            <ExtraSectionsEditor
+              design={design}
+              onAdd={(kind) => void store.addExtraSection(kind)}
+              onUpdate={store.updateExtraSection}
+              onRemove={store.removeExtraSection}
+            />
+          }
+        />
+      ),
+    review: (
+      <ResumeReview
+        design={design}
+        profile={previewProfile}
+        pageCount={pageCount}
+        fit={fit}
+        onFit={fitToPages}
+        onUndoFit={fit && fit.status !== 'running' && fitUndo.current ? undoFit : undefined}
+      />
+    ),
+  };
+
+  const controlPanel = (
+    <aside className="flex min-h-0 min-w-0 flex-1 flex-col border-r bg-background max-lg:border-r-0">
+      <div role="tablist" aria-label="Studio panels" className="grid shrink-0 grid-cols-5 gap-1 border-b p-2">
+        {TABS.map(({ id, label, icon: Icon }) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={tab === id}
+            onClick={() => setTab(id)}
+            className={cn(
+              'flex min-w-0 flex-col items-center gap-1 rounded-lg px-1 py-2 text-[11px] font-medium transition outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+              tab === id ? 'bg-brand-soft text-brand' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+            )}
+          >
+            <Icon className="size-4" />
+            <span className="max-w-full truncate">{label}</span>
+          </button>
+        ))}
+      </div>
+      <div className="builder-scroll @container min-h-0 flex-1 overflow-y-auto overscroll-contain p-3">
+        <div className={cn(tab === 'content' ? 'space-y-3' : 'studio-panel-flow')}>{panels[tab]}</div>
+      </div>
+    </aside>
+  );
+
+  const canvas = (
+    <section className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-muted/60" aria-label="Live pages">
+      <div ref={setCanvasEl} className="studio-canvas scrollbar-thin min-h-0 flex-1 overflow-auto px-6 py-6">
+        <div className="mx-auto w-max">
+          <ResumePageStack
+            key={doc}
+            design={design}
+            profile={previewProfile}
+            letter={letterBody}
+            displayWidth={Math.round(nativeW * scale)}
+            gap={24}
+            idPrefix="studio-page"
+            onPageCount={setPageCount}
+            onMeasureHeader={doc === 'resume' ? store.setHeaderMetrics : undefined}
+            onMeasureLayout={doc === 'resume' ? store.setLayoutMetrics : undefined}
+          />
+        </div>
+      </div>
+
+      <div className="pointer-events-none absolute inset-x-0 bottom-4 flex justify-center">
+        <div className="pointer-events-auto flex items-center gap-1 rounded-full border bg-popover/95 p-1 text-popover-foreground shadow-lg backdrop-blur">
+          <Button variant="ghost" size="icon-sm" className="rounded-full" aria-label="Zoom out" disabled={!canZoomOut} onClick={() => stepZoom(-1)}>
+            <Minus />
+          </Button>
+          <button
+            type="button"
+            onClick={() => setZoom('fit')}
+            title="Fit to width (Ctrl+0)"
+            className={cn(
+              'h-7 min-w-14 rounded-full px-2 text-xs font-medium tabular-nums transition hover:bg-muted',
+              zoom === 'fit' && 'text-brand',
+            )}
+          >
+            {Math.round(scale * 100)}%
+          </button>
+          <Button variant="ghost" size="icon-sm" className="rounded-full" aria-label="Zoom in" disabled={!canZoomIn} onClick={() => stepZoom(1)}>
+            <Plus />
+          </Button>
+          <span className="mx-1 h-4 w-px bg-border" aria-hidden="true" />
+          <span className="px-2 text-xs text-muted-foreground tabular-nums">
+            {pageCount} {pageCount === 1 ? 'page' : 'pages'} · {PAPER_SIZES[paper].label}
+          </span>
+        </div>
+      </div>
+    </section>
+  );
+
+  return (
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      <PageTitle title="Resume studio" />
+
+      <header className="flex shrink-0 flex-wrap items-center gap-2 border-b bg-background px-3 py-2.5 sm:px-4">
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            className="inline-flex h-9 min-w-0 max-w-[18rem] flex-1 items-center gap-2 sm:flex-none rounded-lg px-2 text-left outline-none transition hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 data-popup-open:bg-muted"
+            aria-label="Switch resume"
+          >
+            <LayoutTemplate className="size-4 shrink-0 text-brand" />
+            <span className="min-w-0">
+              <span className="block truncate text-sm font-semibold">{activeResume?.name ?? 'My resume'}</span>
+            </span>
+            {store.switchingResume ? (
+              <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
+            ) : (
+              <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
+            )}
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start" className="max-h-80 min-w-64">
+            <DropdownMenuGroup>
+              <DropdownMenuLabel className="text-xs text-muted-foreground">Your resumes</DropdownMenuLabel>
+              {store.resumes.map((r) => (
+                <DropdownMenuItem key={r.id} onClick={() => void store.switchResume(r.id)}>
+                  <FileText />
+                  <span className="min-w-0 flex-1 truncate">{r.name}</span>
+                  {r.id === store.activeResumeId && <span className="text-[10px] font-semibold text-brand">Editing</span>}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuGroup>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem render={<Link to="/app/documents" />}>
+              <FileType2 />
+              All documents
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        {hasLetter && (
+          <div role="group" aria-label="Document" className="order-3 inline-flex rounded-lg border bg-muted p-0.5 sm:order-none">
+            {(['resume', 'letter'] as const).map((k) => (
+              <button
+                key={k}
+                type="button"
+                onClick={() => setDoc(k)}
+                aria-pressed={doc === k}
+                className={cn(
+                  'rounded-md px-2.5 py-1 text-xs font-medium transition',
+                  doc === k ? 'bg-card text-foreground shadow-sm ring-1 ring-border' : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {k === 'resume' ? 'Resume' : 'Cover letter'}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="order-3 flex min-w-0 flex-wrap items-center gap-1.5 sm:order-none sm:ml-auto sm:justify-end sm:gap-2">
+          <div role="group" aria-label="Paper size" className="inline-flex rounded-lg border bg-muted p-0.5">
+            {(['letter', 'a4'] as const).map((p) => (
+              <button
+                key={p}
+                type="button"
+                onClick={() => store.updateLayout({ paper: p })}
+                aria-pressed={paper === p}
+                className={cn(
+                  'rounded-md px-2.5 py-1 text-xs font-medium transition',
+                  paper === p ? 'bg-card text-foreground shadow-sm ring-1 ring-border' : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {p === 'letter' ? 'Letter' : 'A4'}
+              </button>
+            ))}
+          </div>
+
+          <Toolbar
+            dirty={dirty}
+            saving={store.saving}
+            ready={store.ready}
+            savingTheme={store.savingTheme}
+            compact
+            onReset={store.resetToSaved}
+            onSaveTheme={(name) => store.saveCurrentAsTheme(name)}
+          />
+
+        </div>
+
+        <div className="order-2 inline-flex sm:order-none">
+          <Button className="rounded-r-none" onClick={() => void exportAs('pdf')} disabled={exporting != null}>
+            {exporting === 'pdf' ? <Loader2 className="animate-spin" /> : <Download />}
+            PDF
+          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button className="rounded-l-none border-l border-l-primary-foreground/20 px-2" aria-label="More download formats" disabled={exporting != null} />
+              }
+            >
+              {exporting === 'docx' ? <Loader2 className="animate-spin" /> : <ChevronDown />}
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-64">
+              <DropdownMenuItem onClick={() => void exportAs('pdf')}>
+                <Download />
+                <span className="flex flex-col">
+                  <span>PDF</span>
+                  <span className="text-xs text-muted-foreground">Exactly what you see here</span>
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => void exportAs('docx')}>
+                <FileType2 />
+                <span className="flex flex-col">
+                  <span>Word (editable)</span>
+                  <span className="text-xs text-muted-foreground">Same design, spacing may shift in Word</span>
+                </span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </header>
+
+      {(store.saveError || store.themeError || exportError || store.profileWorkCount === 0) && (
+        <div className="shrink-0 space-y-2 border-b bg-background px-3 py-2 sm:px-4">
+          {[store.saveError, store.themeError, exportError].filter(Boolean).map((msg) => (
+            <p key={msg} className="flex items-start gap-2 text-sm text-destructive">
+              <AlertCircle className="mt-0.5 size-4 shrink-0" />
+              {msg}
+            </p>
+          ))}
+          {store.profileWorkCount === 0 && (
+            <p className="flex items-start gap-2 text-sm text-muted-foreground">
+              <AlertCircle className="mt-0.5 size-4 shrink-0 text-status-preparing" />
+              <span>
+                Add work experience on your <Link to="/app/profile" className="font-medium text-brand underline-offset-2 hover:underline">Profile</Link> to fill the experience section.
+              </span>
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="flex shrink-0 border-b p-1.5 lg:hidden">
+        <div role="group" aria-label="Studio view" className="grid w-full grid-cols-2 gap-1 rounded-lg bg-muted p-0.5">
+          {(
+            [
+              ['edit', 'Edit', SlidersHorizontal],
+              ['preview', 'Preview', ScanEye],
+            ] as const
+          ).map(([v, label, Icon]) => (
+            <button
+              key={v}
+              type="button"
+              aria-pressed={mobileView === v}
+              onClick={() => setMobileView(v)}
+              className={cn(
+                'inline-flex items-center justify-center gap-1.5 rounded-md py-1.5 text-sm font-medium transition',
+                mobileView === v ? 'bg-card text-foreground shadow-sm ring-1 ring-border' : 'text-muted-foreground',
+              )}
+            >
+              <Icon className="size-4" />
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div
+        className={cn(
+          'relative grid min-h-0 flex-1 grid-cols-1 overflow-hidden',
+          aiOpen
+            ? 'lg:grid-cols-[minmax(0,1fr)_minmax(20rem,22rem)] xl:grid-cols-[minmax(28rem,32rem)_minmax(0,1fr)_minmax(20rem,22rem)] 2xl:grid-cols-[minmax(36rem,43rem)_minmax(0,1fr)_minmax(20rem,22rem)]'
+            : 'lg:grid-cols-[minmax(30rem,34rem)_minmax(0,1fr)] xl:grid-cols-[minmax(36rem,43rem)_minmax(0,1fr)]',
+        )}
+      >
+        <div
+          className={cn(
+            'relative z-10 min-h-0 bg-background',
+            // On lg (but not xl) the AI rail replaces the control column so the
+            // canvas stays readable. xl+ keeps both AI and controls.
+            aiOpen && !isDesktop
+              ? 'hidden'
+              : aiOpen && isDesktop
+                ? 'hidden xl:flex xl:flex-col'
+                : isDesktop || mobileView === 'edit'
+                  ? 'flex flex-col'
+                  : 'hidden',
+          )}
+        >
+          {controlPanel}
+        </div>
+        <div
+          className={cn(
+            'relative z-0 min-h-0 flex flex-col',
+            // Keep the preview mounted while Edit is showing so the measurer
+            // does not write zeros (that used to look like a save). Do not use
+            // `invisible` / visibility:hidden: page slices set visibility:visible
+            // on on-page blocks and those children paint through the parent.
+            parkPreview && 'pointer-events-none absolute inset-0 overflow-hidden opacity-0',
+          )}
+          aria-hidden={parkPreview || undefined}
+          inert={parkPreview || undefined}
+        >
+          {canvas}
+          <StudioAiChatToggle
+            open={aiOpen}
+            onToggle={() => {
+              setAiOpen((v) => {
+                const next = !v;
+                if (next && !isDesktop) setMobileView('edit');
+                return next;
+              });
+            }}
+          />
+        </div>
+
+        <div
+          className={cn(
+            'relative z-10 min-h-0 min-w-0 bg-background',
+            aiOpen && (isDesktop || mobileView === 'edit') ? 'flex flex-col' : 'hidden',
+          )}
+        >
+          <StudioAiChat
+            open={aiOpen}
+            resumeId={activeId}
+            onClose={() => setAiOpen(false)}
+            onCoverLetter={(body) => {
+              setLetter(body);
+              if (body.trim()) setDoc('resume');
+            }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}

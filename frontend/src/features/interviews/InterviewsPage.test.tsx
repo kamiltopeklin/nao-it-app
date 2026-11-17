@@ -1,0 +1,326 @@
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router-dom';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { toast } from 'sonner';
+import * as api from '@/api/interviewsApi';
+import { TooltipProvider } from '@/components/ui/tooltip';
+import { stubLayout } from '../integrations/testUtils';
+import { makeEvent, makeOverview, makeProcess } from './interviewsFixtures';
+import { InterviewsPage } from './InterviewsPage';
+
+vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn(), message: vi.fn() } }));
+vi.mock('@/api/interviewsApi', () => ({
+  fetchInterviews: vi.fn(),
+  startMailConnect: vi.fn(),
+  disconnectMail: vi.fn(async () => undefined),
+  syncInterviews: vi.fn(async () => ({ started: true })),
+  createInterview: vi.fn(async () => ({ id: 'new' })),
+  updateInterview: vi.fn(async () => undefined),
+  deleteInterview: vi.fn(async () => undefined),
+  addInterviewEvent: vi.fn(async () => ({ id: 'ev' })),
+  updateInterviewEvent: vi.fn(async () => undefined),
+  deleteInterviewEvent: vi.fn(async () => undefined),
+}));
+vi.mock('@/api/reportShareApi', () => ({
+  fetchIncomingShares: vi.fn(async () => ({
+    shares: [
+      {
+        id: 'in1',
+        owner_name: 'Alex Kim',
+        owner_headline: null,
+        message: null,
+        shared_at: null,
+        expires_at: null,
+        last_viewed_at: null,
+      },
+    ],
+  })),
+  fetchReportShares: vi.fn(async () => ({ shares: [], max_shares: 25, expiry_choices: [7, 30, 90] })),
+  createReportShares: vi.fn(),
+  updateReportShare: vi.fn(),
+  deleteReportShare: vi.fn(),
+}));
+const mocked = vi.mocked(api);
+
+function renderPage(path = '/app/interviews') {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={[path]}>
+          <InterviewsPage />
+        </MemoryRouter>
+      </TooltipProvider>
+    </QueryClientProvider>,
+  );
+}
+
+const inTwoDays = new Date(Date.now() + 2 * 86_400_000).toISOString();
+
+const pipeline = makeOverview({
+  processes: [
+    makeProcess({
+      id: 'p1',
+      company: 'Acme',
+      stage: 'interviewing',
+      events: [makeEvent({ id: 'e1', title: 'System design', scheduled_at: inTwoDays, duration_minutes: 60 })],
+      next_event: makeEvent({ id: 'e1', title: 'System design', scheduled_at: inTwoDays }),
+    }),
+    makeProcess({
+      id: 'p2',
+      company: 'Globex',
+      stage: 'screening',
+      needs_action: true,
+      events: [
+        makeEvent({
+          id: 'e2',
+          kind: 'scheduling',
+          status: 'needs_scheduling',
+          title: 'Book recruiter call',
+          email_date: new Date(Date.now() - 2 * 86_400_000 - 60_000).toISOString(),
+        }),
+      ],
+    }),
+    makeProcess({ id: 'p3', company: 'Initech', stage: 'rejected', status: 'closed' }),
+  ],
+  summary: { active: 2, upcoming_week: 1, needs_action: 1, offers: 0, closed: 1 },
+});
+
+beforeAll(stubLayout);
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+describe('InterviewsPage', () => {
+  it('locks the page behind the email connection', async () => {
+    mocked.fetchInterviews.mockResolvedValue(makeOverview({ connection: { connected: false } }));
+    const user = userEvent.setup();
+    renderPage();
+
+    const gate = await screen.findByRole('region', { name: 'Connect your email' });
+    expect(screen.queryByRole('button', { name: /sync now/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Pipeline' })).not.toBeInTheDocument();
+
+    await user.click(within(gate).getByRole('button', { name: 'Connect email' }));
+    expect(mocked.startMailConnect).toHaveBeenCalled();
+    expect(mocked.syncInterviews).not.toHaveBeenCalled();
+  });
+
+  it('disables connecting when the server has no mail credentials', async () => {
+    mocked.fetchInterviews.mockResolvedValue(
+      makeOverview({ server: { server_configured: false, providers: [] }, connection: { connected: false } }),
+    );
+    renderPage();
+    expect(await screen.findByRole('button', { name: 'Connect email' })).toBeDisabled();
+    expect(screen.getByRole('status')).toHaveTextContent(/isn't configured/);
+  });
+
+  it('asks to reconnect when access was revoked', async () => {
+    mocked.fetchInterviews.mockResolvedValue(
+      makeOverview({ connection: { connected: true, email: 'me@example.com', status: 'needs_reauth' } }),
+    );
+    renderPage();
+    expect(await screen.findByRole('button', { name: 'Reconnect email' })).toBeEnabled();
+  });
+
+  it('shows upcoming interviews, actions and the board once connected', async () => {
+    mocked.fetchInterviews.mockResolvedValue(pipeline);
+    renderPage();
+
+    const board = await screen.findByRole('region', { name: 'Pipeline' });
+    expect(within(board).getByRole('region', { name: 'Interviewing column' })).toHaveTextContent('Acme');
+    expect(within(board).getByRole('region', { name: 'Screening column' })).toHaveTextContent('Globex');
+    expect(within(board).getByRole('button', { name: /closed processes \(1\)/i })).toBeInTheDocument();
+
+    expect(screen.getByRole('region', { name: 'Upcoming interviews' })).toHaveTextContent('Acme · System design');
+    const actions = screen.getByRole('region', { name: 'Needs your action' });
+    expect(actions).toHaveTextContent('Pick a time');
+    expect(actions).toHaveTextContent('2 days ago');
+    const syncButton = screen.getByRole('button', { name: 'Sync now, last synced just now' });
+    expect(syncButton).toHaveTextContent('Sync now· synced just now');
+    expect(screen.getByText('Interviews this week')).toBeInTheDocument();
+    expect(mocked.syncInterviews).not.toHaveBeenCalled();
+  });
+
+  it('opens the share dialog and lists reports shared with you', async () => {
+    mocked.fetchInterviews.mockResolvedValue(pipeline);
+    renderPage();
+    await screen.findByRole('region', { name: 'Pipeline' });
+    expect(await screen.findByRole('button', { name: 'Shared with you, 1' }, { timeout: 3000 })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Share report' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Share your job search report' });
+    expect(await within(dialog).findByText(/Nobody has access yet/)).toBeInTheDocument();
+  });
+
+  it('lays out every interview round of a company on one line, in date order', async () => {
+    const day = (h: number) => new Date(new Date(Date.now() + 3 * 86_400_000).setHours(h, 0, 0, 0)).toISOString();
+    const sent = new Date(Date.now() - 86_400_000).toISOString();
+    mocked.fetchInterviews.mockResolvedValue(
+      makeOverview({
+        processes: [
+          makeProcess({
+            id: 'p9',
+            company: 'Hooli',
+            stage: 'interviewing',
+            remaining_steps: ['Culture interview with the team'],
+            events: [
+              makeEvent({ id: 'c', kind: 'behavioral', title: 'Values interview', scheduled_at: day(15), email_date: sent }),
+              makeEvent({ id: 'a', kind: 'technical', title: 'Live coding', scheduled_at: day(10), email_date: sent }),
+              makeEvent({ id: 'r', kind: 'technical', title: 'Reminder: Live coding', scheduled_at: day(10), email_date: sent }),
+              makeEvent({ id: 'b', kind: 'technical', title: 'System design', scheduled_at: day(12), email_date: sent }),
+              makeEvent({ id: 'n', kind: 'scheduling', status: 'needs_scheduling', title: 'Book your onsite loop', email_date: sent }),
+            ],
+          }),
+        ],
+      }),
+    );
+    renderPage();
+
+    const column = await screen.findByRole('region', { name: 'Interviewing column' });
+    const steps = within(column).getByRole('list', { name: 'Hooli interview steps' });
+    const names = within(steps)
+      .getAllByRole('button')
+      .map((el) => el.getAttribute('aria-label'));
+    expect(names).toEqual([
+      'Step 1, Live coding, Hooli',
+      'Step 2, System design, Hooli',
+      'Step 3, Values interview, Hooli',
+      'Step 4, Book your onsite loop, Hooli',
+      'Ignore step 4, Book your onsite loop',
+    ]);
+    expect(steps).toHaveTextContent('Culture interview with the team');
+    expect(steps).toHaveTextContent('Coming up');
+    expect(within(column).getByRole('region', { name: 'Up next: Coding' })).toHaveTextContent('Hooli');
+    expect(within(column).getByRole('list', { name: 'Rounds by type' })).toHaveTextContent('System design 1');
+  });
+
+  it('syncs automatically when the last sync is stale and on demand', async () => {
+    mocked.fetchInterviews.mockResolvedValue(
+      makeOverview({
+        ...pipeline,
+        connection: { ...pipeline.connection, last_synced_at: new Date(Date.now() - 3 * 3_600_000).toISOString() },
+      }),
+    );
+    const user = userEvent.setup();
+    renderPage();
+
+    await waitFor(() => expect(mocked.syncInterviews).toHaveBeenCalledTimes(1));
+    expect(mocked.syncInterviews.mock.calls[0][0]).toEqual(expect.any(String));
+    await user.click(await screen.findByRole('button', { name: /sync now/i }));
+    await waitFor(() => expect(mocked.syncInterviews).toHaveBeenCalledTimes(2));
+  });
+
+  it('starts the first sync after returning from the provider', async () => {
+    mocked.fetchInterviews.mockResolvedValue(makeOverview({ connection: { ...makeOverview().connection, last_synced_at: null } }));
+    renderPage('/app/interviews?mail=connected');
+    await waitFor(() => expect(mocked.syncInterviews).toHaveBeenCalledTimes(1));
+    expect(toast.success).toHaveBeenCalledWith(expect.stringMatching(/email connected/i));
+  });
+
+  it('reports a failed connection', async () => {
+    mocked.fetchInterviews.mockResolvedValue(makeOverview({ connection: { connected: false } }));
+    renderPage('/app/interviews?mail=error&reason=invalid_state');
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/expired/)));
+    expect(mocked.syncInterviews).not.toHaveBeenCalled();
+  });
+
+  it('opens a process and updates its stage and steps', async () => {
+    mocked.fetchInterviews.mockResolvedValue(pipeline);
+    const user = userEvent.setup();
+    renderPage();
+
+    const board = await screen.findByRole('region', { name: 'Pipeline' });
+    await user.click(within(board).getByRole('button', { name: 'Acme, Engineer' }));
+
+    const stage = await screen.findByLabelText('Stage');
+    await user.selectOptions(stage, 'final');
+    await waitFor(() => expect(mocked.updateInterview).toHaveBeenCalledWith('p1', { stage: 'final' }));
+
+    await user.click(screen.getByRole('button', { name: 'Mark done' }));
+    await waitFor(() => expect(mocked.updateInterviewEvent).toHaveBeenCalledWith('e1', { status: 'completed' }));
+  });
+
+  it('opens the exact email from cards and rows, with Details for the side sheet', async () => {
+    const acmeMail = 'https://mail.google.com/mail/?authuser=me@example.com#all/m-acme';
+    const globexMail = 'https://mail.google.com/mail/?authuser=me@example.com#all/m-globex';
+    mocked.fetchInterviews.mockResolvedValue(
+      makeOverview({
+        ...pipeline,
+        processes: [
+          { ...pipeline.processes[0], email_url: acmeMail, next_event: { ...pipeline.processes[0].next_event!, email_url: acmeMail } },
+          {
+            ...pipeline.processes[1],
+            email_url: globexMail,
+            events: [{ ...pipeline.processes[1].events[0], email_url: globexMail }],
+          },
+          pipeline.processes[2],
+        ],
+      }),
+    );
+    const user = userEvent.setup();
+    renderPage();
+
+    const board = await screen.findByRole('region', { name: 'Pipeline' });
+    const card = within(board).getByRole('link', { name: 'Acme, Engineer. Open email' });
+    expect(card).toHaveAttribute('href', acmeMail);
+    expect(card).toHaveAttribute('target', '_blank');
+    expect(card).toHaveAttribute('rel', expect.stringContaining('noopener'));
+
+    const upcoming = screen.getByRole('region', { name: 'Upcoming interviews' });
+    expect(within(upcoming).getByRole('link', { name: 'Acme, System design. Open email' })).toHaveAttribute('href', acmeMail);
+    const actions = screen.getByRole('region', { name: 'Needs your action' });
+    expect(within(actions).getByRole('link', { name: 'Globex, Book recruiter call. Open email' })).toHaveAttribute(
+      'href',
+      globexMail,
+    );
+
+    await user.click(within(board).getByRole('button', { name: 'Details for Acme, Engineer' }));
+    expect(await screen.findByLabelText('Stage')).toBeInTheDocument();
+  });
+
+  it('ignores an action from the list and from its pipeline card', async () => {
+    mocked.fetchInterviews.mockResolvedValue(pipeline);
+    const user = userEvent.setup();
+    renderPage();
+
+    const actions = await screen.findByRole('region', { name: 'Needs your action' });
+    const board = screen.getByRole('region', { name: 'Pipeline' });
+    expect(within(board).getByRole('button', { name: 'Ignore Globex, Engineer action' })).toBeInTheDocument();
+
+    mocked.fetchInterviews.mockResolvedValue({
+      ...pipeline,
+      processes: pipeline.processes.map((p) =>
+        p.id === 'p2' ? { ...p, needs_action: false, events: p.events.map((e) => ({ ...e, ignored: true })) } : p,
+      ),
+      summary: { ...pipeline.summary, needs_action: 0 },
+    });
+    await user.click(within(actions).getByRole('button', { name: 'Ignore Globex, Book recruiter call' }));
+
+    await waitFor(() => expect(mocked.updateInterviewEvent).toHaveBeenCalledWith('e2', { ignored: true }));
+    await waitFor(() => expect(actions).toHaveTextContent('You are all caught up'));
+    expect(within(board).queryByRole('button', { name: /^Ignore Globex/ })).not.toBeInTheDocument();
+    expect(toast.success).toHaveBeenCalledWith('Ignored: Globex, Book recruiter call', expect.anything());
+  });
+
+  it('adds a process manually', async () => {
+    mocked.fetchInterviews.mockResolvedValue(pipeline);
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: 'Add process' }));
+    await user.type(screen.getByRole('textbox', { name: 'Company' }), 'Umbrella');
+    const dialog = screen.getByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'Add process' }));
+    await waitFor(() =>
+      expect(mocked.createInterview).toHaveBeenCalledWith({
+        company: 'Umbrella',
+        role_title: null,
+        stage: 'screening',
+        notes: null,
+      }),
+    );
+  });
+});

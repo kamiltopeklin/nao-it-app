@@ -1,0 +1,615 @@
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter, useLocation } from 'react-router-dom';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import * as settingsApi from '@/api/settingsApi';
+import * as profileApi from '@/api/profileApi';
+import { useJobsStore } from '@/stores/jobsStore';
+import { useScraperStore } from '@/stores/scraperStore';
+import { completeForm } from '@/test/profileFixtures';
+import type { UserSettings } from '@/types/settings';
+import { PreferencesPage } from './PreferencesPage';
+
+vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+vi.mock('@/api/client', () => ({
+  apiClient: { post: vi.fn(async () => ({ data: {} })), get: vi.fn(async () => ({ data: {} })) },
+}));
+vi.mock('@/api/settingsApi', () => ({
+  fetchUserSettings: vi.fn(),
+  updateUserSettings: vi.fn(),
+  saveCountryPreferences: vi.fn(),
+  saveJobMatchPreferences: vi.fn(),
+  saveMinMatchScoreSettings: vi.fn(),
+  saveDedupSettings: vi.fn(),
+  saveAutoPrepareSettings: vi.fn(),
+  saveManualSubmitPipelineSettings: vi.fn(),
+  saveApplicationResumeSource: vi.fn(),
+  saveTailoringStrategy: vi.fn(),
+  fetchOriginalResume: vi.fn(async () => null),
+  uploadOriginalResume: vi.fn(),
+  saveMatchQualityCheckSettings: vi.fn(),
+  saveJobShareDefaultSettings: vi.fn(),
+  saveResumeFilenameSettings: vi.fn(),
+  previewDocumentFilename: vi.fn(async () => ({ resume: 'Jane_Doe_resume.pdf', cover_letter: 'Jane_Doe_cover_letter.pdf' })),
+  saveResumeTailoringPromptSettings: vi.fn(),
+  saveCoverLetterPromptSettings: vi.fn(),
+  saveOpenAiSettings: vi.fn(),
+  saveProviderKeySettings: vi.fn(),
+  testOpenAiKey: vi.fn(),
+  testProviderKey: vi.fn(),
+  previewMinMatchScore: vi.fn(),
+  applyMinMatchScore: vi.fn(),
+  previewDedupRules: vi.fn(),
+  applyDedupRules: vi.fn(),
+  fetchCoverLetterPromptDefaults: vi.fn(async () => ({ default_instructions: '', max_length: 12000, min_length: 50 })),
+}));
+vi.mock('@/api/profileApi', () => ({
+  fetchProfileForm: vi.fn(),
+  saveAddressPreferences: vi.fn(async () => ({})),
+  saveEeoPreferences: vi.fn(async () => ({})),
+}));
+
+const api = vi.mocked(settingsApi);
+const profile = vi.mocked(profileApi);
+
+const LONG_PROMPT = 'Write a concise, achievement-focused resume tailored to the job description.';
+
+function makeSettings(overrides: Partial<UserSettings> = {}): UserSettings {
+  return {
+    openai_key_mode: 'default',
+    openai_key_configured: false,
+    openai_key_hint: null,
+    system_openai_available: true,
+    llm_provider: 'openai',
+    default_llm_provider: 'openai',
+    available_providers: ['openai', 'anthropic', 'gemini'],
+    llm_model: null,
+    default_llm_model: 'gpt',
+    anthropic_key_mode: 'custom',
+    anthropic_key_configured: true,
+    anthropic_key_hint: 'sk-ant-…9f2c',
+    system_anthropic_available: true,
+    gemini_key_mode: 'default',
+    gemini_key_configured: false,
+    gemini_key_hint: null,
+    system_gemini_available: false,
+    dedup_recycle_mode: 'custom',
+    dedup_recycle_days: 60,
+    dedup_recycle_days_custom: 60,
+    default_dedup_recycle_days: 60,
+    min_match_score_mode: 'custom',
+    min_match_score: 40,
+    min_match_score_custom: 40,
+    default_min_match_score: 0,
+    dedup_applied_company_mode: 'custom',
+    dedup_applied_company_enabled: false,
+    dedup_applied_company_enabled_custom: false,
+    default_dedup_applied_company_enabled: false,
+    dedup_score_comparison_mode: 'custom',
+    dedup_score_comparison_enabled: false,
+    dedup_score_comparison_enabled_custom: false,
+    default_dedup_score_comparison_enabled: false,
+    auto_prepare_match: false,
+    auto_prepare_full: false,
+    manual_submit_pipeline: 'full',
+    application_resume_source: 'tailored',
+    resume_tailoring_strategy: 'job_first',
+    match_quality_check: 'rescore',
+    match_quality_check_min_score: 70,
+    job_share_default: 'private',
+    job_share_locked: false,
+    team_space_name: null,
+    team_space_public_id: null,
+    resume_filename_mode: 'pattern',
+    resume_filename_value: '{firstname}_{lastname}_{kind}',
+    resume_tailoring_prompt_mode: 'custom',
+    resume_tailoring_prompt_instructions: LONG_PROMPT,
+    resume_tailoring_prompt_instructions_custom: LONG_PROMPT,
+    default_resume_tailoring_prompt_instructions: 'Default resume instructions that are long enough to be valid.',
+    resume_tailoring_output_contract: '',
+    resume_tailoring_prompt_max_length: 12000,
+    cover_letter_prompt_mode: 'default',
+    cover_letter_prompt_instructions: 'Default cover letter instructions that are long enough to pass.',
+    cover_letter_prompt_instructions_custom: '',
+    default_cover_letter_prompt_instructions: 'Default cover letter instructions that are long enough to pass.',
+    cover_letter_prompt_max_length: 12000,
+    job_match_preferences: '',
+    job_match_preferences_max_length: 4000,
+    country_preferences: ['US'],
+    country_preferences_source: 'manual',
+    work_mode_preferences: [],
+    available_countries: [
+      { code: 'US', name: 'United States' },
+      { code: 'CA', name: 'Canada' },
+      { code: 'DE', name: 'Germany' },
+    ],
+    resume_template_status: 'missing',
+    resume_template_source_filename: null,
+    resume_template_error: null,
+    resume_template_profile_work_count: null,
+    resume_template_analyzed_at: null,
+    resume_template_ready: false,
+    cover_letter_template_status: 'missing',
+    cover_letter_template_source_filename: null,
+    cover_letter_template_error: null,
+    cover_letter_template_analyzed_at: null,
+    cover_letter_template_ready: false,
+    profile_work_count: 1,
+    validation_errors: [],
+    ...overrides,
+  };
+}
+
+beforeAll(() => {
+  globalThis.ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as unknown as typeof ResizeObserver;
+  Element.prototype.scrollIntoView = function scrollIntoView() {};
+});
+
+let refreshLists: ReturnType<typeof vi.fn>;
+let loadJobs: ReturnType<typeof vi.fn>;
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  api.fetchUserSettings.mockResolvedValue(makeSettings());
+  profile.fetchProfileForm.mockResolvedValue(completeForm());
+  refreshLists = vi.fn(async () => {});
+  loadJobs = vi.fn(async () => {});
+  useJobsStore.setState({ refreshLists } as never);
+  useScraperStore.setState({ loadJobs } as never);
+});
+
+function LocationProbe() {
+  const loc = useLocation();
+  return <div data-testid="location">{loc.pathname + loc.search}</div>;
+}
+
+function renderPage(path = '/app/preferences') {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[path]}>
+        <PreferencesPage />
+        <LocationProbe />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+const saveBar = () => screen.getByRole('region', { name: 'Unsaved changes' });
+const saveButton = () => within(saveBar()).getByRole('button', { name: /Save changes/ });
+
+describe('PreferencesPage', () => {
+  it('shows a loading state, then renders every tab', { timeout: 15000 }, async () => {
+    const user = userEvent.setup();
+    renderPage();
+    expect(screen.getByLabelText('Loading preferences')).toBeInTheDocument();
+
+    expect(await screen.findByRole('region', { name: 'Job match preferences' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'When you add jobs' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('tab', { name: 'Matching' }));
+    expect(screen.getByRole('region', { name: 'Minimum match score' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Duplicate handling' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('tab', { name: 'Application details' }));
+    expect(await screen.findByRole('region', { name: 'Address and location' })).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'EEO and work eligibility' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('tab', { name: 'AI & keys' }));
+    const anthropic = screen.getByRole('region', { name: 'Anthropic' });
+    expect(within(anthropic).getByText('Your key ••••9f2c')).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'OpenAI' })).getByText('Using NAO default')).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'Gemini' })).getByText('Default unavailable')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('tab', { name: /Prompts/ }));
+    expect(screen.getByRole('region', { name: 'Resume tailoring prompt' })).toBeInTheDocument();
+    expect(screen.getByText(/Re-run jobs to regenerate documents/)).toBeInTheDocument();
+  });
+
+  it('summarises the saved preferences in the header', async () => {
+    api.fetchUserSettings.mockResolvedValue(
+      makeSettings({ application_resume_source: 'original', work_mode_preferences: ['remote', 'hybrid'] }),
+    );
+    renderPage();
+    const summary = await screen.findByLabelText('Current preferences');
+    expect(summary).toHaveTextContent('Original résumé');
+    expect(summary).toHaveTextContent('40 and up');
+    expect(summary).toHaveTextContent('Remote, Hybrid');
+  });
+
+  it('shows an error with retry when settings fail to load', async () => {
+    api.fetchUserSettings.mockRejectedValueOnce({ response: { data: { detail: 'Server down' } } });
+    const user = userEvent.setup();
+    renderPage();
+    expect(await screen.findByText('Server down')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByRole('region', { name: 'Job match preferences' })).toBeInTheDocument();
+  });
+
+  it('syncs the active tab with the ?tab= search param', async () => {
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    const matching = await screen.findByRole('tab', { name: 'Matching' });
+    expect(matching).toHaveAttribute('aria-selected', 'true');
+
+    await user.click(screen.getByRole('tab', { name: 'AI & keys' }));
+    expect(screen.getByTestId('location')).toHaveTextContent('/app/preferences?tab=ai');
+
+    await user.click(screen.getByRole('tab', { name: 'Job search' }));
+    expect(screen.getByTestId('location')).toHaveTextContent(/^\/app\/preferences$/);
+  });
+
+  it('saves match preferences from the Job search tab', async () => {
+    api.saveJobMatchPreferences.mockResolvedValue(makeSettings({ job_match_preferences: 'Remote staff roles' }));
+    const user = userEvent.setup();
+    renderPage();
+    await user.type(await screen.findByLabelText("What you're looking for"), 'Remote staff roles');
+
+    await user.click(saveButton());
+    await waitFor(() =>
+      expect(api.saveJobMatchPreferences).toHaveBeenCalledWith({ job_match_preferences: 'Remote staff roles' }),
+    );
+  });
+
+  it('saves the default job-sharing choice immediately', async () => {
+    api.saveJobShareDefaultSettings.mockResolvedValue(makeSettings({ job_share_default: 'team' }));
+    const user = userEvent.setup();
+    renderPage();
+    expect(await screen.findByRole('radio', { name: /Keep them private/ })).toBeChecked();
+    expect(screen.queryByRole('radio', { name: /Ask me each time/ })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('radio', { name: /Share with my team space/ }));
+    await waitFor(() =>
+      expect(api.saveJobShareDefaultSettings).toHaveBeenCalledWith({ job_share_default: 'team' }),
+    );
+  });
+
+  it('keeps a tab draft when switching tabs', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await user.type(await screen.findByLabelText("What you're looking for"), 'Keep me');
+    await user.click(screen.getByRole('tab', { name: 'Matching' }));
+    expect(screen.getByRole('tab', { name: /Job search.*unsaved changes/ })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Unsaved changes' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('tab', { name: /Job search/ }));
+    expect(screen.getByLabelText("What you're looking for")).toHaveValue('Keep me');
+    expect(saveBar()).toBeInTheDocument();
+  });
+
+  it('saves a custom minimum match score from the save bar', async () => {
+    api.saveMinMatchScoreSettings.mockResolvedValue(makeSettings({ min_match_score_custom: 72, min_match_score: 72 }));
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    const input = await screen.findByRole('spinbutton', { name: 'Minimum match score' });
+    fireEvent.change(input, { target: { value: '72' } });
+    // jsdom has no layout, so Base UI keeps the thumb visibility:hidden.
+    const slider = screen.getAllByRole('slider', { hidden: true })[0];
+    expect(slider).toHaveAttribute('aria-labelledby', 'min-score-label');
+    expect(slider).toHaveValue('72');
+
+    await user.click(saveButton());
+    await waitFor(() =>
+      expect(api.saveMinMatchScoreSettings).toHaveBeenCalledWith({ min_match_score_mode: 'custom', min_match_score: 72 }),
+    );
+    expect(api.saveDedupSettings).not.toHaveBeenCalled();
+  });
+
+  it('saves dedup settings with custom modes', async () => {
+    api.saveDedupSettings.mockResolvedValue(makeSettings({ dedup_recycle_days: 90, dedup_applied_company_enabled: true }));
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    await user.click(await screen.findByRole('button', { name: '90 days' }));
+    await user.click(screen.getByRole('switch', { name: 'Hide applied companies' }));
+    expect(screen.getByRole('button', { name: 'Preview' })).toBeDisabled();
+
+    await user.click(saveButton());
+    await waitFor(() =>
+      expect(api.saveDedupSettings).toHaveBeenCalledWith({
+        dedup_recycle_mode: 'custom',
+        dedup_recycle_days: 90,
+        dedup_applied_company_mode: 'custom',
+        dedup_applied_company_enabled: true,
+        dedup_score_comparison_mode: 'custom',
+        dedup_score_comparison_enabled: false,
+      }),
+    );
+  });
+
+  it('saves auto-prepare immediately; turning on documents turns on scoring', async () => {
+    let resolve: (s: UserSettings) => void = () => {};
+    api.saveAutoPrepareSettings.mockImplementation(() => new Promise((r) => (resolve = r)));
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    await user.click(await screen.findByRole('switch', { name: 'Prepare documents automatically' }));
+
+    expect(api.saveAutoPrepareSettings).toHaveBeenCalledWith({ auto_prepare_match: true, auto_prepare_full: true });
+    expect(screen.getByRole('switch', { name: 'Score new jobs automatically' })).toBeChecked();
+    expect(screen.queryByRole('region', { name: 'Unsaved changes' })).not.toBeInTheDocument();
+
+    resolve(makeSettings({ auto_prepare_match: true, auto_prepare_full: true }));
+    const { toast } = await import('sonner');
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
+  });
+
+  it('saves the resume for applications and keeps cover letter prep in original mode', async () => {
+    api.saveApplicationResumeSource.mockResolvedValue(
+      makeSettings({ application_resume_source: 'original', auto_prepare_match: true, auto_prepare_full: true }),
+    );
+    api.fetchUserSettings.mockResolvedValue(makeSettings({ auto_prepare_match: true, auto_prepare_full: true }));
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    expect(await screen.findByRole('radio', { name: 'Tailored resume per job' })).toBeChecked();
+
+    await user.click(screen.getByRole('radio', { name: 'My original resume' }));
+    await waitFor(() =>
+      expect(api.saveApplicationResumeSource).toHaveBeenCalledWith({ application_resume_source: 'original' }),
+    );
+    await waitFor(() => expect(screen.getByRole('radio', { name: 'My original resume' })).toBeChecked());
+    const docs = screen.getByRole('switch', { name: 'Prepare documents automatically' });
+    expect(docs).not.toHaveAttribute('data-disabled');
+    expect(docs).toBeChecked();
+    expect(screen.getByText(/Score plus a cover letter/)).toBeInTheDocument();
+    const { toast } = await import('sonner');
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith(expect.stringContaining('applications use your original resume file')),
+    );
+    expect(await screen.findByText('No resume file on record')).toBeInTheDocument();
+  });
+
+  it('saves how tailoring writes experience', async () => {
+    api.saveTailoringStrategy.mockResolvedValue(makeSettings({ resume_tailoring_strategy: 'evidence' }));
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    expect(await screen.findByRole('radio', { name: 'Rebuild around the job' })).toBeChecked();
+
+    await user.click(screen.getByRole('radio', { name: 'Stay close to my resume' }));
+    await waitFor(() =>
+      expect(api.saveTailoringStrategy).toHaveBeenCalledWith({ resume_tailoring_strategy: 'evidence' }),
+    );
+    await waitFor(() => expect(screen.getByRole('radio', { name: 'Stay close to my resume' })).toBeChecked());
+  });
+
+  it('hides the tailoring choice when applications use the original resume', async () => {
+    api.fetchUserSettings.mockResolvedValue(makeSettings({ application_resume_source: 'original' }));
+    renderPage('/app/preferences?tab=matching');
+    expect(await screen.findByRole('radio', { name: 'My original resume' })).toBeChecked();
+    expect(screen.queryByRole('radio', { name: 'Rebuild around the job' })).not.toBeInTheDocument();
+  });
+
+  it('shows and replaces the resume file applications upload', async () => {
+    api.fetchOriginalResume.mockResolvedValue({
+      filename: 'Jane Doe.pdf',
+      kind: 'pdf',
+      byte_size: 204800,
+      uploaded_at: '2026-10-01T00:00:00Z',
+      has_text: true,
+    });
+    api.uploadOriginalResume.mockResolvedValue({
+      filename: 'Jane Doe 2026.docx',
+      kind: 'docx',
+      byte_size: 51200,
+      uploaded_at: '2026-10-07T00:00:00Z',
+      has_text: true,
+    });
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    expect(await screen.findByText('Jane Doe.pdf')).toBeInTheDocument();
+    expect(screen.getByText(/PDF, 200 KB/)).toBeInTheDocument();
+
+    const file = new File(['PK'], 'Jane Doe 2026.docx', {
+      type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    });
+    await user.upload(screen.getByLabelText('Resume file for applications'), file);
+    await waitFor(() => expect(api.uploadOriginalResume).toHaveBeenCalledWith(file));
+    expect(await screen.findByText('Jane Doe 2026.docx')).toBeInTheDocument();
+    expect(screen.getByText(/Word file, 50 KB/)).toBeInTheDocument();
+  });
+
+  it('saves the AI quality check mode and its auto threshold', async () => {
+    api.saveMatchQualityCheckSettings.mockImplementation(async (body) => makeSettings({ ...body, match_quality_check: 'auto' }));
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    expect(await screen.findByRole('radio', { name: 'When I re-run a job' })).toBeChecked();
+    expect(screen.queryByLabelText('Check new matches scoring at least')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('radio', { name: 'Also for strong new matches' }));
+    await waitFor(() =>
+      expect(api.saveMatchQualityCheckSettings).toHaveBeenCalledWith({ match_quality_check: 'auto' }),
+    );
+    const threshold = await screen.findByLabelText('Check new matches scoring at least');
+    await user.clear(threshold);
+    await user.type(threshold, '150{Enter}');
+    await waitFor(() =>
+      expect(api.saveMatchQualityCheckSettings).toHaveBeenCalledWith({ match_quality_check_min_score: 100 }),
+    );
+  });
+
+  it('builds a document file name pattern with fields and previews it before saving', async () => {
+    api.previewDocumentFilename.mockImplementation(async ({ value }) => ({
+      resume: `${value.replace('{company}', 'Acme')}.pdf`,
+      cover_letter: `${value.replace('{company}', 'Acme')}_cover_letter.pdf`,
+    }));
+    api.saveResumeFilenameSettings.mockImplementation(async (body) => makeSettings(body));
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    const card = await screen.findByRole('region', { name: 'Document file names' });
+    expect(await within(card).findByTestId('filename-preview-resume')).toHaveTextContent('{firstname}_{lastname}_{kind}.pdf');
+    const save = within(card).getByRole('button', { name: 'Save file names' });
+    expect(save).toBeDisabled();
+
+    const input = within(card).getByLabelText('File name pattern');
+    await user.clear(input);
+    await user.type(input, 'Jane');
+    await user.click(within(card).getByRole('button', { name: '{company}' }));
+    expect(input).toHaveValue('Jane_{company}');
+    await waitFor(() => expect(within(card).getByTestId('filename-preview-resume')).toHaveTextContent('Jane_Acme.pdf'));
+
+    await user.click(save);
+    await waitFor(() =>
+      expect(api.saveResumeFilenameSettings).toHaveBeenCalledWith({
+        resume_filename_mode: 'pattern',
+        resume_filename_value: 'Jane_{company}',
+      }),
+    );
+    await waitFor(() => expect(save).toBeDisabled());
+  });
+
+  it('shows why a file name is rejected and blocks a fixed name left empty', async () => {
+    api.previewDocumentFilename.mockImplementation(async ({ value }) => {
+      if (value.includes('{salary}')) throw { response: { data: { detail: 'Unknown field {salary}.' } } };
+      return { resume: 'x.pdf', cover_letter: 'x_cover_letter.pdf' };
+    });
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    const card = await screen.findByRole('region', { name: 'Document file names' });
+    const input = within(card).getByLabelText('File name pattern');
+    fireEvent.change(input, { target: { value: '{salary}' } });
+    expect(await within(card).findByText('Unknown field {salary}.')).toBeInTheDocument();
+    expect(within(card).getByRole('button', { name: 'Save file names' })).toBeDisabled();
+
+    await user.click(within(card).getByRole('radio', { name: /Same name for every job/ }));
+    expect(within(card).getByLabelText('File name')).toHaveValue('');
+    expect(within(card).getByText('Enter a file name.')).toBeInTheDocument();
+    expect(within(card).getByRole('button', { name: 'Save file names' })).toBeDisabled();
+  });
+
+  it('saves the paste-link pipeline immediately', async () => {
+    api.saveManualSubmitPipelineSettings.mockResolvedValue(makeSettings({ manual_submit_pipeline: 'match' }));
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    await user.click(await screen.findByRole('radio', { name: 'Up to analysis' }));
+    await waitFor(() =>
+      expect(api.saveManualSubmitPipelineSettings).toHaveBeenCalledWith({ manual_submit_pipeline: 'match' }),
+    );
+  });
+
+  it('previews min-score counts and confirms before hiding jobs', async () => {
+    api.previewMinMatchScore.mockResolvedValue({
+      threshold: 40,
+      threshold_mode: 'custom',
+      analyzed_visible_count: 12,
+      would_hide_count: 3,
+      meeting_threshold_count: 9,
+      already_hidden_count: 5,
+      would_restore_count: 1,
+      samples: [],
+    });
+    api.applyMinMatchScore.mockResolvedValue({
+      success: true,
+      min_match_score: 40,
+      hidden: 3,
+      restored: 1,
+      settings: makeSettings(),
+    });
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=matching');
+    await user.click(await screen.findByRole('button', { name: 'Check jobs' }));
+    expect(api.previewMinMatchScore).toHaveBeenCalledWith({ min_match_score_mode: 'custom', min_match_score: 40 });
+
+    const tiles = await screen.findByLabelText('Match score preview');
+    const value = (label: string) => within(tiles).getByText(label).nextElementSibling?.textContent;
+    expect(value('Visible')).toBe('12');
+    expect(value('Will hide')).toBe('3');
+    expect(value('Hidden')).toBe('5');
+    expect(value('Will restore')).toBe('1');
+
+    await user.click(screen.getByRole('button', { name: 'Hide from dashboard' }));
+    const dialog = await screen.findByRole('alertdialog');
+    expect(within(dialog).getByText('Hide low-scoring jobs?')).toBeInTheDocument();
+    expect(api.applyMinMatchScore).not.toHaveBeenCalled();
+
+    await user.click(within(dialog).getByRole('button', { name: 'Hide jobs' }));
+    await waitFor(() =>
+      expect(api.applyMinMatchScore).toHaveBeenCalledWith({ min_match_score_mode: 'custom', min_match_score: 40 }),
+    );
+    await waitFor(() => expect(refreshLists).toHaveBeenCalled());
+  });
+
+  it('requires a passing key test before saving a new custom key', async () => {
+    api.testOpenAiKey.mockResolvedValue({ ok: true, message: 'Key works.' });
+    api.saveOpenAiSettings.mockResolvedValue(
+      makeSettings({ openai_key_mode: 'custom', openai_key_configured: true, openai_key_hint: 'sk-…abcd' }),
+    );
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=ai');
+    const card = await screen.findByRole('region', { name: 'OpenAI' });
+    await user.click(within(within(card).getByRole('group', { name: 'OpenAI key mode' })).getByRole('button', { name: 'Custom' }));
+    await user.type(within(card).getByLabelText('OpenAI API key'), 'sk-new');
+    const save = within(card).getByRole('button', { name: 'Save key' });
+    expect(save).toBeDisabled();
+
+    await user.click(within(card).getByRole('button', { name: 'Test key' }));
+    expect(api.testOpenAiKey).toHaveBeenCalledWith('sk-new');
+    expect(await within(card).findByText('Key works.')).toBeInTheDocument();
+    expect(save).toBeEnabled();
+
+    await user.click(save);
+    await waitFor(() =>
+      expect(api.saveOpenAiSettings).toHaveBeenCalledWith({ openai_key_mode: 'custom', openai_api_key: 'sk-new' }),
+    );
+  });
+
+  it('confirms before switching a configured key back to the default', async () => {
+    api.saveProviderKeySettings.mockResolvedValue(
+      makeSettings({ anthropic_key_mode: 'default', anthropic_key_configured: false, anthropic_key_hint: null }),
+    );
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=ai');
+    const card = await screen.findByRole('region', { name: 'Anthropic' });
+    await user.click(within(within(card).getByRole('group', { name: 'Anthropic key mode' })).getByRole('button', { name: 'Default' }));
+    await user.click(within(card).getByRole('button', { name: 'Use NAO default' }));
+
+    const dialog = await screen.findByRole('alertdialog');
+    expect(api.saveProviderKeySettings).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole('button', { name: 'Remove key' }));
+    await waitFor(() =>
+      expect(api.saveProviderKeySettings).toHaveBeenCalledWith('anthropic', { mode: 'default', clear: true }),
+    );
+  });
+
+  it('blocks saving a prompt shorter than the minimum length', async () => {
+    api.saveResumeTailoringPromptSettings.mockResolvedValue(makeSettings());
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=prompts');
+    const editor = await screen.findByLabelText('Resume tailoring prompt instructions');
+    fireEvent.change(editor, { target: { value: 'too short' } });
+
+    expect(screen.getByText('Must be 50–12,000 characters.')).toBeInTheDocument();
+    expect(saveButton()).toBeDisabled();
+
+    fireEvent.change(editor, { target: { value: `${LONG_PROMPT} Keep it to one page.` } });
+    expect(saveButton()).toBeEnabled();
+    await user.click(saveButton());
+    await waitFor(() =>
+      expect(api.saveResumeTailoringPromptSettings).toHaveBeenCalledWith({
+        resume_tailoring_prompt_mode: 'custom',
+        resume_tailoring_prompt_custom: `${LONG_PROMPT} Keep it to one page.`,
+      }),
+    );
+  });
+
+  it('saves address and EEO answers together from Application details', async () => {
+    const user = userEvent.setup();
+    renderPage('/app/preferences?tab=application');
+    await user.type(await screen.findByLabelText('City'), 'Austin');
+    await user.type(screen.getByLabelText('Local preferences'), 'Remote US{Enter}');
+    expect(screen.getByRole('button', { name: 'Remove Remote US' })).toBeInTheDocument();
+    await user.type(screen.getByLabelText('Local preferences'), 'remote us{Enter}');
+    expect(screen.getByText('That location is already in your list.')).toBeInTheDocument();
+
+    await user.click(within(screen.getByRole('group', { name: 'Protected veteran' })).getByRole('button', { name: 'I am a veteran' }));
+
+    await user.click(saveButton());
+    await waitFor(() =>
+      expect(profile.saveAddressPreferences).toHaveBeenCalledWith(
+        expect.objectContaining({ city: 'Austin', local_preferences: ['Remote US'] }),
+      ),
+    );
+    expect(profile.saveEeoPreferences).toHaveBeenCalledWith(expect.objectContaining({ veteran_status: true }));
+    await waitFor(() => expect(profile.fetchProfileForm).toHaveBeenCalledTimes(2));
+  });
+});

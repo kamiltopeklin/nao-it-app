@@ -1,0 +1,430 @@
+import { apiClient } from './client';
+import {
+  MATCH_QUALITY_CHECK_MODES,
+  type LlmProvider,
+  type MatchQualityCheckMode,
+  type ResumeFilenameMode,
+  type SettingsMode,
+  type UserSettings,
+  type UserSettingsUpdate,
+} from '../types/settings';
+
+export interface OpenAiKeyTestResult {
+  ok: boolean;
+  message: string;
+}
+
+export interface MinMatchScorePreviewSample {
+  job_id: string;
+  title?: string | null;
+  company?: string | null;
+  match_score: number;
+}
+
+export interface MinMatchScorePreview {
+  threshold: number;
+  threshold_mode: string;
+  analyzed_visible_count: number;
+  would_hide_count: number;
+  meeting_threshold_count: number;
+  already_hidden_count: number;
+  would_restore_count: number;
+  samples: MinMatchScorePreviewSample[];
+}
+
+export interface MinMatchScoreApplyResult {
+  success: boolean;
+  min_match_score: number;
+  hidden: number;
+  restored: number;
+  settings: UserSettings;
+}
+
+export type MinMatchScoreDraft = {
+  min_match_score_mode: SettingsMode;
+  min_match_score?: number;
+};
+
+function normalizeUserSettings(data: Partial<UserSettings>): UserSettings {
+  return {
+    openai_key_mode: (data.openai_key_mode as SettingsMode) ?? 'default',
+    openai_key_configured: Boolean(data.openai_key_configured),
+    openai_key_hint: (data.openai_key_hint as string | null | undefined) ?? null,
+    system_openai_available: Boolean(data.system_openai_available),
+    llm_provider: (data.llm_provider as LlmProvider) ?? 'openai',
+    default_llm_provider: (data.default_llm_provider as LlmProvider) ?? 'openai',
+    available_providers: Array.isArray(data.available_providers)
+      ? (data.available_providers as LlmProvider[])
+      : ['openai'],
+    llm_model: (data.llm_model as string | null | undefined) ?? null,
+    default_llm_model: String(data.default_llm_model ?? ''),
+    anthropic_key_mode: (data.anthropic_key_mode as SettingsMode) ?? 'default',
+    anthropic_key_configured: Boolean(data.anthropic_key_configured),
+    anthropic_key_hint: (data.anthropic_key_hint as string | null | undefined) ?? null,
+    system_anthropic_available: Boolean(data.system_anthropic_available),
+    gemini_key_mode: (data.gemini_key_mode as SettingsMode) ?? 'default',
+    gemini_key_configured: Boolean(data.gemini_key_configured),
+    gemini_key_hint: (data.gemini_key_hint as string | null | undefined) ?? null,
+    system_gemini_available: Boolean(data.system_gemini_available),
+    dedup_recycle_mode: (data.dedup_recycle_mode as SettingsMode) ?? 'default',
+    dedup_recycle_days: Number(data.dedup_recycle_days ?? 60),
+    dedup_recycle_days_custom: Number(data.dedup_recycle_days_custom ?? 60),
+    default_dedup_recycle_days: Number(data.default_dedup_recycle_days ?? 60),
+    min_match_score_mode: (data.min_match_score_mode as SettingsMode) ?? 'default',
+    min_match_score: Number(data.min_match_score ?? 0),
+    min_match_score_custom: Number(data.min_match_score_custom ?? 0),
+    default_min_match_score: Number(data.default_min_match_score ?? 0),
+    dedup_applied_company_mode: (data.dedup_applied_company_mode as SettingsMode) ?? 'default',
+    dedup_applied_company_enabled: Boolean(data.dedup_applied_company_enabled),
+    dedup_applied_company_enabled_custom: Boolean(data.dedup_applied_company_enabled_custom),
+    default_dedup_applied_company_enabled: Boolean(data.default_dedup_applied_company_enabled),
+    dedup_score_comparison_mode: (data.dedup_score_comparison_mode as SettingsMode) ?? 'default',
+    dedup_score_comparison_enabled: Boolean(data.dedup_score_comparison_enabled),
+    dedup_score_comparison_enabled_custom: Boolean(data.dedup_score_comparison_enabled_custom),
+    default_dedup_score_comparison_enabled: Boolean(data.default_dedup_score_comparison_enabled),
+    auto_prepare_match: Boolean(data.auto_prepare_match),
+    auto_prepare_full: Boolean(data.auto_prepare_full),
+    application_resume_source: data.application_resume_source === 'original' ? 'original' : 'tailored',
+    resume_tailoring_strategy: data.resume_tailoring_strategy === 'job_first' ? 'job_first' : 'evidence',
+    match_quality_check: MATCH_QUALITY_CHECK_MODES.includes(data.match_quality_check as MatchQualityCheckMode)
+      ? (data.match_quality_check as MatchQualityCheckMode)
+      : 'rescore',
+    match_quality_check_min_score: Math.min(100, Math.max(0, Number(data.match_quality_check_min_score ?? 70) || 0)),
+    manual_submit_pipeline: (['extract', 'match', 'full'] as const).includes(
+      data.manual_submit_pipeline as 'extract' | 'match' | 'full',
+    )
+      ? (data.manual_submit_pipeline as 'extract' | 'match' | 'full')
+      : 'full',
+    job_share_default: (['private', 'team', 'all'] as const).includes(
+      data.job_share_default as 'private' | 'team' | 'all',
+    )
+      ? (data.job_share_default as 'private' | 'team' | 'all')
+      : 'private',
+    job_share_locked: Boolean(data.job_share_locked),
+    team_space_name: typeof data.team_space_name === 'string' ? data.team_space_name : null,
+    team_space_public_id: typeof data.team_space_public_id === 'string' ? data.team_space_public_id : null,
+    resume_filename_mode: data.resume_filename_mode === 'static' ? 'static' : 'pattern',
+    resume_filename_value: String(data.resume_filename_value ?? '{firstname}_{lastname}_{kind}'),
+    resume_tailoring_prompt_mode: (data.resume_tailoring_prompt_mode as SettingsMode) ?? 'default',
+    resume_tailoring_prompt_instructions: String(data.resume_tailoring_prompt_instructions ?? ''),
+    resume_tailoring_prompt_instructions_custom: String(data.resume_tailoring_prompt_instructions_custom ?? ''),
+    default_resume_tailoring_prompt_instructions: String(
+      data.default_resume_tailoring_prompt_instructions ?? '',
+    ),
+    resume_tailoring_output_contract: String(data.resume_tailoring_output_contract ?? ''),
+    resume_tailoring_prompt_max_length: Number(data.resume_tailoring_prompt_max_length ?? 12000),
+    cover_letter_prompt_mode: (data.cover_letter_prompt_mode as SettingsMode) ?? 'default',
+    cover_letter_prompt_instructions: String(data.cover_letter_prompt_instructions ?? ''),
+    cover_letter_prompt_instructions_custom: String(data.cover_letter_prompt_instructions_custom ?? ''),
+    default_cover_letter_prompt_instructions: String(
+      data.default_cover_letter_prompt_instructions ?? '',
+    ),
+    cover_letter_prompt_max_length: Number(data.cover_letter_prompt_max_length ?? 12000),
+    job_match_preferences: String(data.job_match_preferences ?? ''),
+    job_match_preferences_max_length: Number(data.job_match_preferences_max_length ?? 4000),
+    country_preferences: Array.isArray(data.country_preferences)
+      ? (data.country_preferences as string[])
+      : [],
+    country_preferences_source:
+      (['unset', 'auto', 'manual'] as const).find((s) => s === data.country_preferences_source) ??
+      'unset',
+    work_mode_preferences: Array.isArray(data.work_mode_preferences)
+      ? (data.work_mode_preferences as UserSettings['work_mode_preferences']).filter((m) =>
+          m === 'remote' || m === 'hybrid' || m === 'onsite',
+        )
+      : [],
+    available_countries: Array.isArray(data.available_countries)
+      ? (data.available_countries as UserSettings['available_countries'])
+      : [],
+    resume_template_status: (data.resume_template_status as UserSettings['resume_template_status']) ?? 'missing',
+    resume_template_source_filename: (data.resume_template_source_filename as string | null | undefined) ?? null,
+    resume_template_error: (data.resume_template_error as string | null | undefined) ?? null,
+    resume_template_profile_work_count:
+      data.resume_template_profile_work_count != null
+        ? Number(data.resume_template_profile_work_count)
+        : null,
+    resume_template_analyzed_at: (data.resume_template_analyzed_at as string | null | undefined) ?? null,
+    resume_template_ready: Boolean(data.resume_template_ready),
+    cover_letter_template_status:
+      (data.cover_letter_template_status as UserSettings['cover_letter_template_status']) ?? 'missing',
+    cover_letter_template_source_filename:
+      (data.cover_letter_template_source_filename as string | null | undefined) ?? null,
+    cover_letter_template_error: (data.cover_letter_template_error as string | null | undefined) ?? null,
+    cover_letter_template_analyzed_at:
+      (data.cover_letter_template_analyzed_at as string | null | undefined) ?? null,
+    cover_letter_template_ready: Boolean(data.cover_letter_template_ready),
+    profile_work_count: Number(data.profile_work_count ?? 0),
+    validation_errors: Array.isArray(data.validation_errors)
+      ? (data.validation_errors as string[])
+      : [],
+  };
+}
+
+export async function fetchUserSettings(): Promise<UserSettings> {
+  const { data } = await apiClient.get<Partial<UserSettings>>('/settings');
+  return normalizeUserSettings(data);
+}
+
+export async function updateUserSettings(body: UserSettingsUpdate): Promise<UserSettings> {
+  const { data } = await apiClient.put<Partial<UserSettings>>('/settings', body);
+  return normalizeUserSettings(data);
+}
+
+export async function testOpenAiKey(openaiApiKey?: string): Promise<OpenAiKeyTestResult> {
+  const { data } = await apiClient.post<OpenAiKeyTestResult>('/settings/openai/test', {
+    openai_api_key: openaiApiKey?.trim() || undefined,
+  });
+  return data;
+}
+
+export async function testProviderKey(
+  provider: LlmProvider,
+  apiKey?: string,
+): Promise<OpenAiKeyTestResult> {
+  const { data } = await apiClient.post<OpenAiKeyTestResult>('/settings/llm/test', {
+    provider,
+    api_key: apiKey?.trim() || undefined,
+  });
+  return data;
+}
+
+export async function setActiveLlmProvider(provider: LlmProvider): Promise<UserSettings> {
+  return updateUserSettings({ llm_provider: provider });
+}
+
+export async function setActiveLlmModel(model: string | null): Promise<UserSettings> {
+  if (!model) return updateUserSettings({ clear_llm_model: true });
+  return updateUserSettings({ llm_model: model });
+}
+
+export async function saveProviderKeySettings(
+  provider: 'anthropic' | 'gemini',
+  body: {
+    mode: SettingsMode;
+    apiKey?: string;
+    clear?: boolean;
+  },
+): Promise<UserSettings> {
+  const payload: UserSettingsUpdate = {};
+  if (provider === 'anthropic') {
+    payload.anthropic_key_mode = body.mode;
+    if (body.apiKey) payload.anthropic_api_key = body.apiKey;
+    if (body.clear) payload.clear_anthropic_api_key = true;
+  } else {
+    payload.gemini_key_mode = body.mode;
+    if (body.apiKey) payload.gemini_api_key = body.apiKey;
+    if (body.clear) payload.clear_gemini_api_key = true;
+  }
+  return updateUserSettings(payload);
+}
+
+export async function saveOpenAiSettings(
+  body: Pick<UserSettingsUpdate, 'openai_key_mode' | 'openai_api_key' | 'clear_openai_api_key'>,
+) {
+  return updateUserSettings(body);
+}
+
+export async function saveDedupSettings(
+  body: Pick<
+    UserSettingsUpdate,
+    | 'dedup_recycle_mode'
+    | 'dedup_recycle_days'
+    | 'dedup_applied_company_mode'
+    | 'dedup_applied_company_enabled'
+    | 'dedup_score_comparison_mode'
+    | 'dedup_score_comparison_enabled'
+  >,
+) {
+  return updateUserSettings(body);
+}
+
+export async function saveAutoPrepareSettings(
+  body: Pick<UserSettingsUpdate, 'auto_prepare_match' | 'auto_prepare_full'>,
+) {
+  return updateUserSettings(body);
+}
+
+export async function saveApplicationResumeSource(
+  body: Pick<UserSettingsUpdate, 'application_resume_source'>,
+) {
+  return updateUserSettings(body);
+}
+
+export async function saveTailoringStrategy(body: Pick<UserSettingsUpdate, 'resume_tailoring_strategy'>) {
+  return updateUserSettings(body);
+}
+
+/** The resume file applications upload in "My original resume" mode. */
+export interface OriginalResumeFile {
+  filename: string;
+  kind: 'pdf' | 'docx' | string;
+  byte_size: number;
+  uploaded_at: string | null;
+  has_text: boolean;
+}
+
+export async function fetchOriginalResume(): Promise<OriginalResumeFile | null> {
+  const { data } = await apiClient.get<OriginalResumeFile | null>('/profile/original-resume');
+  return data ?? null;
+}
+
+export async function uploadOriginalResume(file: File): Promise<OriginalResumeFile> {
+  const fd = new FormData();
+  fd.append('file', file);
+  const { data } = await apiClient.put<OriginalResumeFile>('/profile/original-resume', fd);
+  return data;
+}
+
+export async function saveMatchQualityCheckSettings(
+  body: Pick<UserSettingsUpdate, 'match_quality_check' | 'match_quality_check_min_score'>,
+) {
+  return updateUserSettings(body);
+}
+
+export async function saveManualSubmitPipelineSettings(
+  body: Pick<UserSettingsUpdate, 'manual_submit_pipeline'>,
+) {
+  return updateUserSettings(body);
+}
+
+export async function saveJobShareDefaultSettings(
+  body: Pick<UserSettingsUpdate, 'job_share_default'>,
+) {
+  return updateUserSettings(body);
+}
+
+export async function saveResumeFilenameSettings(
+  body: Pick<UserSettingsUpdate, 'resume_filename_mode' | 'resume_filename_value'>,
+) {
+  return updateUserSettings(body);
+}
+
+export interface DocumentFilenamePreview {
+  resume: string;
+  cover_letter: string;
+}
+
+/** The PDF names an unsaved rule gives for the signed-in user and a sample job. */
+export async function previewDocumentFilename(body: {
+  mode: ResumeFilenameMode;
+  value: string;
+  company?: string;
+  title?: string;
+}): Promise<DocumentFilenamePreview> {
+  const { data } = await apiClient.post<DocumentFilenamePreview>('/settings/document-filename/preview', body);
+  return data;
+}
+
+export async function saveMinMatchScoreSettings(
+  body: Pick<UserSettingsUpdate, 'min_match_score_mode' | 'min_match_score'>,
+) {
+  return updateUserSettings(body);
+}
+
+export async function saveResumeTailoringPromptSettings(
+  body: Pick<UserSettingsUpdate, 'resume_tailoring_prompt_mode' | 'resume_tailoring_prompt_custom'>,
+) {
+  return updateUserSettings(body);
+}
+
+export async function saveCoverLetterPromptSettings(
+  body: Pick<UserSettingsUpdate, 'cover_letter_prompt_mode' | 'cover_letter_prompt_custom'>,
+) {
+  return updateUserSettings(body);
+}
+
+export async function saveCountryPreferences(countries: string[]): Promise<UserSettings> {
+  return updateUserSettings({ country_preferences: countries });
+}
+
+export async function saveJobMatchPreferences(
+  body: Pick<UserSettingsUpdate, 'job_match_preferences' | 'clear_job_match_preferences'>,
+) {
+  return updateUserSettings(body);
+}
+
+export interface CoverLetterPromptDefaults {
+  default_instructions: string;
+  max_length: number;
+  min_length: number;
+}
+
+export async function fetchCoverLetterPromptDefaults(): Promise<CoverLetterPromptDefaults> {
+  const { data } = await apiClient.get<CoverLetterPromptDefaults>('/settings/cover-letter-prompt/defaults');
+  return {
+    default_instructions: String(data.default_instructions ?? ''),
+    max_length: Number(data.max_length ?? 12000),
+    min_length: Number(data.min_length ?? 50),
+  };
+}
+
+export async function previewMinMatchScore(body: MinMatchScoreDraft): Promise<MinMatchScorePreview> {
+  const { data } = await apiClient.post<MinMatchScorePreview>('/settings/min-match-score/preview', body);
+  return data;
+}
+
+export async function applyMinMatchScore(body: MinMatchScoreDraft): Promise<MinMatchScoreApplyResult> {
+  const { data } = await apiClient.post<MinMatchScoreApplyResult>('/settings/min-match-score/apply', body);
+  return {
+    ...data,
+    settings: normalizeUserSettings(data.settings ?? {}),
+  };
+}
+
+export interface DedupRulesPreviewSample {
+  job_id: string;
+  title?: string | null;
+  company?: string | null;
+  exclusion_type?: string | null;
+  action?: string | null;
+  duplicated_because_id?: string | null;
+  match_score?: number | null;
+  best_score?: number | null;
+}
+
+export interface DedupRulesPreview {
+  applied_company_enabled: boolean;
+  score_comparison_enabled: boolean;
+  recycle_days: number;
+  would_restore_count: number;
+  would_hide_applied_company_count: number;
+  would_hide_score_comparison_count: number;
+  already_hidden_applied_company_count: number;
+  already_hidden_score_comparison_count: number;
+  samples: DedupRulesPreviewSample[];
+}
+
+export interface DedupRulesApplyResult {
+  success: boolean;
+  restored: number;
+  restored_location_unknown: number;
+  hidden_applied_company: number;
+  hidden_score_comparison: number;
+  applied_company_enabled: boolean;
+  score_comparison_enabled: boolean;
+  recycle_days: number;
+  settings: UserSettings;
+}
+
+export async function previewDedupRules(): Promise<DedupRulesPreview> {
+  const { data } = await apiClient.post<DedupRulesPreview>('/settings/dedup-rules/preview');
+  return data;
+}
+
+export async function applyDedupRules(): Promise<DedupRulesApplyResult> {
+  const { data } = await apiClient.post<DedupRulesApplyResult>('/settings/dedup-rules/apply');
+  return {
+    ...data,
+    settings: normalizeUserSettings(data.settings ?? {}),
+  };
+}
+
+export async function reconcileMinMatchScore(): Promise<{
+  success: boolean;
+  min_match_score: number;
+  hidden: number;
+  restored: number;
+}> {
+  const { data } = await apiClient.post('/jobs/valid/reconcile-min-match-score');
+  return data;
+}

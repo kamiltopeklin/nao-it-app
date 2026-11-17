@@ -1,0 +1,413 @@
+"""Weekly progress series for the assistant / dashboard home chart.
+
+Per local calendar day (user timezone):
+  * posted, jobs added to the platform (same semantics as dashboard ``today``)
+  * recommended, posted that day AND match score >= the user's effective min
+                  (Preferences page threshold → dashboard ``suggested`` rule)
+  * applied, application confirmation emails received that day once the
+             inbox has synced, otherwise jobs the user marked applied
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+
+from sqlalchemy import and_, cast, func, not_, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.types import Date
+
+from app.models.database import (
+    Job,
+    JobExtraction,
+    JobMatchResult,
+    ResumeBuildResult,
+    UserJobStatus,
+    ValidJobUserApplication,
+)
+from app.models.schemas import ExtractionStatus
+from app.services.job_pipeline_mode import documents_ready_clause
+from app.services.dashboard_stats import (
+    BEST_MATCH_SCORE,
+    _is_remote_expr,
+    _job_added_at_expr,
+    _visible_job_clause,
+)
+from app.storage.user_repository import UserRepository
+from app.utils.date_bounds import recent_week_bounds_for_timezone
+
+
+def _local_date_expr(column, tz_name: str | None):
+    tz = (tz_name or "UTC").strip() or "UTC"
+    as_utc = func.timezone("UTC", column)
+    as_local = func.timezone(tz, as_utc)
+    return cast(as_local, Date)
+
+
+def _rows_to_day_map(rows) -> dict[date, int]:
+    out: dict[date, int] = {}
+    for row in rows:
+        if row.day is None:
+            continue
+        d = row.day if isinstance(row.day, date) else date.fromisoformat(str(row.day))
+        out[d] = int(row.cnt)
+    return out
+
+
+def _dashboard_from(
+    user_id: str,
+    *,
+    with_match: bool = False,
+    with_resume: bool = False,
+    with_application: bool = False,
+):
+    frm = Job.__table__.outerjoin(
+        UserJobStatus.__table__,
+        and_(UserJobStatus.job_id == Job.id, UserJobStatus.user_id == user_id),
+    )
+    if with_match:
+        frm = frm.outerjoin(
+            JobMatchResult.__table__,
+            and_(JobMatchResult.job_id == Job.id, JobMatchResult.user_id == user_id),
+        )
+    if with_resume:
+        frm = frm.outerjoin(
+            ResumeBuildResult.__table__,
+            and_(ResumeBuildResult.job_id == Job.id, ResumeBuildResult.user_id == user_id),
+        )
+    if with_application:
+        frm = frm.outerjoin(
+            ValidJobUserApplication.__table__,
+            and_(
+                ValidJobUserApplication.job_id == Job.id,
+                ValidJobUserApplication.user_id == user_id,
+            ),
+        )
+    return frm
+
+
+def _series_for_days(day_list: list[date], by_day: dict[date, int]) -> list[int]:
+    return [by_day.get(d, 0) for d in day_list]
+
+
+async def _applied_by_day(
+    session: AsyncSession,
+    user_id: str,
+    *,
+    start_utc: datetime,
+    end_utc: datetime,
+    tz_name: str | None,
+) -> dict[date, int]:
+    """Applications per local day: confirmation emails once the inbox has synced, else marks."""
+    from app.services import mail_applications
+
+    if await mail_applications.counts_from_inbox(session, user_id):
+        return await mail_applications.applied_by_day(
+            session, user_id, start_utc=start_utc, end_utc=end_utc, tz_name=tz_name
+        )
+    applied_day = _local_date_expr(ValidJobUserApplication.applied_at, tz_name)
+    rows = (
+        await session.execute(
+            select(applied_day.label("day"), func.count().label("cnt"))
+            .where(
+                ValidJobUserApplication.user_id == user_id,
+                ValidJobUserApplication.applied_at >= start_utc,
+                ValidJobUserApplication.applied_at < end_utc,
+            )
+            .group_by(applied_day)
+        )
+    ).all()
+    return _rows_to_day_map(rows)
+
+
+async def fetch_weekly_progress_series(
+    session: AsyncSession,
+    user_id: str,
+    *,
+    tz_name: str | None,
+    days: int = 7,
+) -> dict:
+    start_utc, end_utc, day_list = recent_week_bounds_for_timezone(tz_name, days=days)
+    users = UserRepository(session)
+    min_score = await users.get_effective_min_match_score(user_id)
+
+    visible = _visible_job_clause(user_id, await users.get_country_preferences(user_id))
+    added_at = _job_added_at_expr()
+    added_day = _local_date_expr(added_at, tz_name)
+
+    posted_rows = (
+        await session.execute(
+            select(added_day.label("day"), func.count().label("cnt"))
+            .select_from(_dashboard_from(user_id))
+            .where(
+                visible,
+                added_at.is_not(None),
+                added_at >= start_utc,
+                added_at < end_utc,
+            )
+            .group_by(added_day)
+        )
+    ).all()
+    posted_by_day = _rows_to_day_map(posted_rows)
+
+    # Recommended = added that day and currently qualifies under Preferences min score
+    # (same threshold as dashboard ``suggested``).
+    recommended_rows = (
+        await session.execute(
+            select(added_day.label("day"), func.count().label("cnt"))
+            .select_from(_dashboard_from(user_id, with_match=True))
+            .where(
+                visible,
+                added_at.is_not(None),
+                added_at >= start_utc,
+                added_at < end_utc,
+                JobMatchResult.overall_score.is_not(None),
+                JobMatchResult.overall_score >= min_score,
+            )
+            .group_by(added_day)
+        )
+    ).all()
+    recommended_by_day = _rows_to_day_map(recommended_rows)
+
+    applied_by_day = await _applied_by_day(
+        session, user_id, start_utc=start_utc, end_utc=end_utc, tz_name=tz_name
+    )
+
+    series = [
+        {
+            "date": d.isoformat(),
+            "label": d.strftime("%a") if days <= 7 else d.strftime("%d"),
+            "posted": posted_by_day.get(d, 0),
+            "recommended": recommended_by_day.get(d, 0),
+            "applied": applied_by_day.get(d, 0),
+        }
+        for d in day_list
+    ]
+    return {
+        "timezone": tz_name or "UTC",
+        "days": days,
+        "min_match_score": min_score,
+        "series": series,
+        "totals": {
+            "posted": sum(x["posted"] for x in series),
+            "recommended": sum(x["recommended"] for x in series),
+            "applied": sum(x["applied"] for x in series),
+        },
+    }
+
+
+async def fetch_board_trend_series(
+    session: AsyncSession,
+    user_id: str,
+    *,
+    tz_name: str | None,
+    days: int = 7,
+) -> dict:
+    """Daily activity series for the four main board side tiles (last *days*).
+
+    * ready, resumes that became ready (docx completed) that day
+    * best, strong match analyses (score >= 75) completed that day
+    * remote, remote-friendly jobs added that day
+    * available, jobs added that day that are scored but not resume-ready
+                  and not marked applied ("Scored")
+    """
+    start_utc, end_utc, day_list = recent_week_bounds_for_timezone(tz_name, days=days)
+    countries = await UserRepository(session).get_country_preferences(user_id)
+    visible = _visible_job_clause(user_id, countries)
+    added_at = _job_added_at_expr()
+    added_day = _local_date_expr(added_at, tz_name)
+    is_remote = _is_remote_expr()
+
+    ready_ts = ResumeBuildResult.updated_at
+    ready_day = _local_date_expr(ready_ts, tz_name)
+    ready_rows = (
+        await session.execute(
+            select(ready_day.label("day"), func.count().label("cnt"))
+            .select_from(_dashboard_from(user_id, with_resume=True))
+            .where(
+                visible,
+                documents_ready_clause(ResumeBuildResult),
+                ready_ts.is_not(None),
+                ready_ts >= start_utc,
+                ready_ts < end_utc,
+            )
+            .group_by(ready_day)
+        )
+    ).all()
+
+    match_ts = JobMatchResult.created_at
+    match_day = _local_date_expr(match_ts, tz_name)
+    best_rows = (
+        await session.execute(
+            select(match_day.label("day"), func.count().label("cnt"))
+            .select_from(_dashboard_from(user_id, with_match=True))
+            .where(
+                visible,
+                JobMatchResult.overall_score >= BEST_MATCH_SCORE,
+                match_ts.is_not(None),
+                match_ts >= start_utc,
+                match_ts < end_utc,
+            )
+            .group_by(match_day)
+        )
+    ).all()
+
+    remote_rows = (
+        await session.execute(
+            select(added_day.label("day"), func.count().label("cnt"))
+            .select_from(_dashboard_from(user_id))
+            .where(
+                visible,
+                added_at.is_not(None),
+                added_at >= start_utc,
+                added_at < end_utc,
+                is_remote == True,  # noqa: E712
+            )
+            .group_by(added_day)
+        )
+    ).all()
+
+    available_from = _dashboard_from(
+        user_id, with_match=True, with_resume=True, with_application=True
+    )
+    available_from = available_from.outerjoin(
+        JobExtraction.__table__,
+        Job.extraction_id == JobExtraction.id,
+    )
+    available_rows = (
+        await session.execute(
+            select(added_day.label("day"), func.count().label("cnt"))
+            .select_from(available_from)
+            .where(
+                visible,
+                added_at.is_not(None),
+                added_at >= start_utc,
+                added_at < end_utc,
+                JobExtraction.status.in_(
+                    (ExtractionStatus.EXTRACTED, ExtractionStatus.COMPLETED)
+                ),
+                JobMatchResult.overall_score.is_not(None),
+                or_(
+                    ResumeBuildResult.id.is_(None),
+                    ResumeBuildResult.resume_pdf_status.is_(None),
+                    not_(documents_ready_clause(ResumeBuildResult)),
+                ),
+                ValidJobUserApplication.id.is_(None),
+            )
+            .group_by(added_day)
+        )
+    ).all()
+
+    applied_by_day = await _applied_by_day(
+        session, user_id, start_utc=start_utc, end_utc=end_utc, tz_name=tz_name
+    )
+
+    # Day-of-month numbers for the sparkline X-axis (e.g. 27, 28, …, 2).
+    labels = [str(d.day) for d in day_list]
+    return {
+        "labels": labels,
+        "dates": [d.isoformat() for d in day_list],
+        "applied": _series_for_days(day_list, applied_by_day),
+        "ready": _series_for_days(day_list, _rows_to_day_map(ready_rows)),
+        "best": _series_for_days(day_list, _rows_to_day_map(best_rows)),
+        "remote": _series_for_days(day_list, _rows_to_day_map(remote_rows)),
+        "available": _series_for_days(day_list, _rows_to_day_map(available_rows)),
+    }
+
+
+async def fetch_admin_board_trend_series(
+    session: AsyncSession,
+    *,
+    tz_name: str | None,
+    days: int = 7,
+) -> dict:
+    """Daily ops series for the admin board side tiles (last *days*).
+
+    * fetched, jobs created that day
+    * extracted, extractions that reached EXTRACTED or COMPLETED that day
+    * sheet_posted, jobs that gained sheet_posted_at that day
+    * pumble_posted, jobs that gained pumble_posted_at that day
+    """
+    from app.models.database import JobExtraction
+    from app.models.schemas import ExtractionStatus
+    from app.services.dashboard_stats import _admin_system_visible_clause
+
+    start_utc, end_utc, day_list = recent_week_bounds_for_timezone(tz_name, days=days)
+    visible = _admin_system_visible_clause()
+    created_day = _local_date_expr(Job.created_at, tz_name)
+
+    fetched_rows = (
+        await session.execute(
+            select(created_day.label("day"), func.count().label("cnt"))
+            .select_from(Job)
+            .where(
+                visible,
+                Job.created_at.is_not(None),
+                Job.created_at >= start_utc,
+                Job.created_at < end_utc,
+            )
+            .group_by(created_day)
+        )
+    ).all()
+
+    ext_ts = func.coalesce(JobExtraction.completed_at, JobExtraction.updated_at)
+    ext_day = _local_date_expr(ext_ts, tz_name)
+    extracted_rows = (
+        await session.execute(
+            select(ext_day.label("day"), func.count().label("cnt"))
+            .select_from(
+                Job.__table__.outerjoin(
+                    JobExtraction.__table__,
+                    Job.extraction_id == JobExtraction.id,
+                )
+            )
+            .where(
+                visible,
+                JobExtraction.status.in_(
+                    (ExtractionStatus.EXTRACTED, ExtractionStatus.COMPLETED)
+                ),
+                ext_ts.is_not(None),
+                ext_ts >= start_utc,
+                ext_ts < end_utc,
+            )
+            .group_by(ext_day)
+        )
+    ).all()
+
+    sheet_day = _local_date_expr(Job.sheet_posted_at, tz_name)
+    sheet_rows = (
+        await session.execute(
+            select(sheet_day.label("day"), func.count().label("cnt"))
+            .select_from(Job)
+            .where(
+                visible,
+                Job.sheet_posted_at.is_not(None),
+                Job.sheet_posted_at >= start_utc,
+                Job.sheet_posted_at < end_utc,
+            )
+            .group_by(sheet_day)
+        )
+    ).all()
+
+    pumble_day = _local_date_expr(Job.pumble_posted_at, tz_name)
+    pumble_rows = (
+        await session.execute(
+            select(pumble_day.label("day"), func.count().label("cnt"))
+            .select_from(Job)
+            .where(
+                visible,
+                Job.pumble_posted_at.is_not(None),
+                Job.pumble_posted_at >= start_utc,
+                Job.pumble_posted_at < end_utc,
+            )
+            .group_by(pumble_day)
+        )
+    ).all()
+
+    labels = [str(d.day) for d in day_list]
+    return {
+        "labels": labels,
+        "fetched": _series_for_days(day_list, _rows_to_day_map(fetched_rows)),
+        "extracted": _series_for_days(day_list, _rows_to_day_map(extracted_rows)),
+        "sheet_posted": _series_for_days(day_list, _rows_to_day_map(sheet_rows)),
+        "pumble_posted": _series_for_days(day_list, _rows_to_day_map(pumble_rows)),
+    }

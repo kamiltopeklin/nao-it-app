@@ -1,0 +1,327 @@
+// Autofill engine routing layer.
+//
+// A job's application form is filled by a platform-specific "engine". Each ATS
+// (Greenhouse, Workday, ...) renders its inputs with a static, consistent style,
+// so a dedicated engine per platform fills it far more reliably than one generic
+// engine. This module is the router: it detects the platform from the job URL
+// and returns the engine descriptor that should run.
+//
+// An engine descriptor declares:
+//   - id / label   : identity shown in the UI
+//   - platform     : the detected platform it serves
+//   - mode         : which side-panel orchestration to use
+//                    ("select" = manual region selection + LLM, the current flow)
+//   - scripts      : the content-script bundle id background.js injects
+//   - available    : whether the engine is implemented and may run
+//
+// To add a dedicated engine later (e.g. Workday): register its bundle in
+// background.js (ENGINE_SCRIPTS), add an ENGINES entry keyed by the platform id
+// with available:true and its mode, and implement that mode in src/panel/autofill/. The
+// router will pick it up automatically.
+
+function hostOf(url) {
+  try {
+    return new URL(url).host.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function pathOf(url) {
+  try {
+    return new URL(url).pathname || "";
+  } catch {
+    return "";
+  }
+}
+
+// Career pages that embed Greenhouse pass gh_jid / gh_src on the parent URL even
+// when the host is not greenhouse.io (e.g. ithaka.org/job/...?gh_jid=...).
+export function hasGreenhouseUrlSignals(url) {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    if (u.searchParams.has("gh_jid") || u.searchParams.has("gh_src")) return true;
+  } catch {}
+  return false;
+}
+
+/** Origins to request before injecting on a career page with an embedded GH form. */
+export function autofillPermissionOrigins(pageUrl, platform) {
+  const origins = [];
+  try {
+    const u = new URL(pageUrl);
+    // chrome.permissions only accepts http(s) host patterns that are covered by
+    // optional_host_permissions (*://*/*). chrome://, about:, file:, and
+    // chrome-extension: origins throw:
+    //   "Only permissions specified in the manifest may be requested."
+    if (u.protocol === "http:" || u.protocol === "https:") {
+      origins.push(u.origin + "/*");
+    }
+  } catch {}
+  if (platform === "greenhouse" || hasGreenhouseUrlSignals(pageUrl)) {
+    origins.push("https://*.greenhouse.io/*");
+  }
+  return [...new Set(origins.filter(Boolean))];
+}
+
+// Host -> platform id. Ordered, first match wins. Add new ATS hosts here.
+const PLATFORM_MATCHERS = [
+  ["greenhouse", (h) => h.includes("greenhouse.io") || h.includes("greenhouse-")],
+  ["applytojob", (h) => h.includes("applytojob.com")],
+  ["recruiterflow", (h) => h.includes("recruiterflow.com") || h.includes("rfcareers.")],
+  // Pinpoint HQ white-label careers sites: careers.[company].com/.../postings/.../applications
+  ["pinpoint", (h, p) => /^careers\./.test(h) && /\/postings\/.+\/applications/.test(p || "")],
+  ["workday", (h) => h.includes("myworkdayjobs.com") || h.endsWith(".workday.com")],
+  ["lever", (h) => h.includes("lever.co")],
+  ["ashby", (h) => h.includes("ashbyhq.com")],
+  ["smartrecruiters", (h) => h.includes("smartrecruiters.com")],
+  ["icims", (h) => h.includes("icims.com")],
+  ["taleo", (h) => h.includes("taleo.net")],
+  ["bamboohr", (h) => h.includes("bamboohr.com")],
+  ["workable", (h) => h.includes("workable.com")],
+  ["breezy", (h) => h.includes("breezy.hr")],
+  ["jobvite", (h) => h.includes("jobvite.com")],
+  // Manatal white-label careers (careers-page.com / manatal.com).
+  ["manatal", (h) => h.includes("careers-page.com") || h.includes("manatal.com")],
+  ["jobdiva", (h) => h.includes("jobdiva.com")],
+];
+
+// Detect the ATS platform for a job. Prefers the live page URL (the actual
+// application page) and falls back to the job snapshot's source URL.
+export function detectPlatform({ snapshot, pageUrl } = {}) {
+  const candidates = [pageUrl, snapshot && snapshot.url, snapshot && snapshot.source].filter(Boolean);
+  for (const u of candidates) {
+    const h = hostOf(u);
+    const p = pathOf(u);
+    if (!h) continue;
+    for (const [id, test] of PLATFORM_MATCHERS) {
+      if (test(h, p)) return id;
+    }
+    if (hasGreenhouseUrlSignals(u)) return "greenhouse";
+  }
+  return "generic";
+}
+
+// Implemented engine descriptors, keyed by platform id. Platforms without an
+// entry fall back to the generic best-effort select engine.
+export const ENGINES = {
+  greenhouse: {
+    id: "greenhouse",
+    label: "Greenhouse",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    // Greenhouse renders the whole application inside one stable form container
+    // (form#application-form). Instead of manual region tagging, the engine
+    // auto-selects that single container and fills it on Start (no clicking).
+    autoDiscover: true,
+    note: "Finds the application form and fills it automatically.",
+  },
+  // ApplyToJob (JazzHR / "resumator"): the whole application is one native HTML
+  // <form> (text/select/textarea/file - no custom widgets), so the generic
+  // component drivers fill it directly. Reuses the greenhouse bundle and the
+  // auto-discover flow; a small prep step reveals the hidden resume file input.
+  applytojob: {
+    id: "applytojob",
+    label: "JazzHR",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Finds the application form and fills it automatically.",
+  },
+  // RecruiterFlow: one React <form> mixing native inputs, intl-tel-input phone,
+  // react-select (single + multi), custom Yes/No buttons, and repeating
+  // Experience/Education blocks. Reuses the greenhouse bundle + auto-discover;
+  // a prep step adds a repeating row per work/education entry (Workday-style),
+  // fills them deterministically, sets Country, and ticks the consent box.
+  recruiterflow: {
+    id: "recruiterflow",
+    label: "Recruiterflow",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Finds the application form and fills it automatically.",
+  },
+  // Ashby (jobs.ashbyhq.com): the application renders inside one stable container
+  // (.ashby-application-form-container - a div, not a <form>) with standard
+  // <label for> + native inputs and Ashby's own combobox/file widgets. Reuses the
+  // greenhouse bundle + auto-discover flow; the platform-agnostic component
+  // drivers fill text/email/tel/textarea/select/file and the LLM resolves values.
+  // Resume upload is deferred: Ashby parses resumes and overwrites name/email
+  // (see content/engine/ashby.js + file.js race note). Writes go through the
+  // MAIN-world page-bridge so React state commits.
+  ashby: {
+    id: "ashby",
+    label: "Ashby",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Finds the application form and fills it automatically.",
+  },
+  // SmartRecruiters (jobs.smartrecruiters.com): the application renders inside one
+  // stable container (<oc-oneclick-form>) built entirely from SmartRecruiters'
+  // "spl-*" Lit web components, so every real <input>/<textarea> lives inside a
+  // declarative shadow root. Reuses the greenhouse bundle + auto-discover flow;
+  // the engine pierces those shadow roots (gated to this platform) to fill the
+  // personal-info / resume / consent fields via the LLM, and a prep step adds and
+  // saves each Experience/Education entry (Workday-style: Add -> fill -> Save).
+  smartrecruiters: {
+    id: "smartrecruiters",
+    label: "SmartRecruiters",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Finds the application form and fills it automatically.",
+  },
+  // Pinpoint HQ (careers.[company].com): Rails + React-on-Rails application form
+  // (#application-form.external-form) mixing native inputs, intl-tel-input phone,
+  // react-select (single + multi), boolean radios, conditional questions, EEO
+  // selects, and direct-upload file fields. Reuses the greenhouse bundle +
+  // auto-discover; Pinpoint-specific label/option/consent helpers live in
+  // content/engine/pinpoint.js and the shared component drivers.
+  pinpoint: {
+    id: "pinpoint",
+    label: "Pinpoint",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Finds the application form and fills it automatically.",
+  },
+  // Lever (jobs.lever.co): single-page native HTML apply form in
+  // .application-form (.application-label questions, checkbox groups, location
+  // autocomplete, hidden resume input). Reuses the greenhouse bundle +
+  // auto-discover; Lever-specific helpers live in content/engine/lever.js.
+  lever: {
+    id: "lever",
+    label: "Lever",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Finds the application form and fills it automatically.",
+  },
+  // Workable (apply.workable.com): single-page React form with stable data-ui
+  // hooks (application-form, firstname, resume, …), intl-tel-input phone, and
+  // repeating Education/Experience blocks (Add -> editor -> Update). Reuses the
+  // greenhouse bundle + auto-discover; prep owns edu/exp rows; resume uploads last.
+  workable: {
+    id: "workable",
+    label: "Workable",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Finds the application form and fills it automatically.",
+  },
+  // Breezy.hr: AngularJS single- or multi-step form (.application-container)
+  // with native text/email/textarea, radio screening questions, optional EEO,
+  // and a hidden resume file input (#main-attachment). Reuses the greenhouse
+  // bundle + auto-discover; Breezy-specific label/skip helpers live in
+  // content/engine/breezy.js. Resume uploads last (parser may overwrite fields).
+  breezy: {
+    id: "breezy",
+    label: "Breezy",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Finds the Breezy application form and fills it automatically.",
+  },
+  // Jobvite (jobs.jobvite.com): AngularJS application under
+  // <article ng-controller="JVApply"> → <form name="scopeData.applyForm"> with one
+  // or more steps. Fields are native <input>/<select ng-options>/<textarea> and
+  // radio/checkbox <fieldset>s carrying a real label[for], so the generic
+  // component drivers fill them (AngularJS ng-model commits on input+change).
+  // Reuses the greenhouse bundle + auto-discover; Jobvite-specific label/required/
+  // skip helpers + multi-step "Next" navigation live in content/engine/jobvite.js.
+  // Resume/cover-letter use a custom jv-add-attachment widget (handled separately).
+  jobvite: {
+    id: "jobvite",
+    label: "Jobvite",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Finds the application form and fills it automatically.",
+  },
+  // Manatal (careers-page.com): single Vue form of native text/textarea/file +
+  // terms checkbox. Reuses the greenhouse bundle + auto-discover; Manatal-specific
+  // label/required/consent helpers live in content/engine/manatal.js.
+  manatal: {
+    id: "manatal",
+    label: "Manatal",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Finds the application form and fills it automatically.",
+  },
+  // JobDiva (*.jobdiva.com): job page → Apply Now → Quick Apply (No Account)
+  // modal with native React text/file/checkbox controls (.job-app-main). Reuses
+  // the greenhouse bundle + auto-discover; JobDiva-specific prep (open Quick
+  // Apply), labels, and Submit Application live in content/engine/jobdiva.js.
+  jobdiva: {
+    id: "jobdiva",
+    label: "JobDiva",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Opens Quick Apply, fills the application, and submits.",
+  },
+  // iCIMS (*.icims.com): server-rendered candidate profile built from
+  // .iCIMS_ProfileFormTable rows (native inputs + selects) plus iCIMS' own AJAX
+  // dropdown widget, which hides its <select> behind an <a id="X_icimsDropdown">
+  // and fetches options over the network (drivers/icims-dropdown.js owns those).
+  // Reuses the greenhouse bundle + auto-discover. TWO things are iCIMS-specific
+  // and handled in src/panel/autofill/platforms.js: the resume is uploaded FIRST (its onchange submits the
+  // form and iCIMS re-renders the page pre-filled from the parsed resume), and
+  // the "Create a login" block is written deterministically with a generated
+  // password saved to extension storage.
+  icims: {
+    id: "icims",
+    label: "iCIMS",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Uploads your resume first, then fills the candidate profile.",
+  },
+  // Custom company career pages (no known ATS host): auto-discover the richest
+  // form/apply section (no manual region picking). Reuses the greenhouse
+  // driver/LLM bundle; consent "I ACCEPT" prep lives in picker AF_GENERIC_PREP.
+  generic: {
+    id: "generic",
+    label: "Career site",
+    mode: "select",
+    scripts: "greenhouse",
+    available: true,
+    autoDiscover: true,
+    note: "Finds the application form on custom career pages and fills it automatically.",
+  },
+  // Dedicated, deterministic engine: maps a canonical structured profile to
+  // Workday's stable data-automation-id fields. No manual region selection and
+  // no LLM for standard fields.
+  workday: {
+    id: "workday",
+    label: "Workday",
+    mode: "workday",
+    scripts: "workday",
+    available: true,
+    note: "Deterministic auto-fill from your profile.",
+  },
+};
+
+// Resolve the engine for a job. Returns a descriptor with the detected platform
+// attached. Unknown / not-yet-dedicated platforms use the generic engine.
+export function resolveEngine({ snapshot, pageUrl } = {}) {
+  const platform = detectPlatform({ snapshot, pageUrl });
+  const engine = ENGINES[platform] || ENGINES.generic;
+  return { ...engine, platform };
+}

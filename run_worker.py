@@ -1,0 +1,597 @@
+#!/usr/bin/env python3
+"""
+Worker startup script.
+
+Usage:
+    python run_worker.py extraction   # HTTP/browser scraping
+    python run_worker.py analysis     # Phase A match scoring
+    python run_worker.py tailoring    # Phase B resume tailoring
+    python run_worker.py save         # post-analysis persistence (+ Phase B enqueue)
+    python run_worker.py autopost     # Sheets/Pumble auto-post
+    python run_worker.py resume       # DOCX/PDF generation
+    python run_worker.py scraper      # Scrapy crawl runs
+    python run_worker.py encoding     # job/profile embeddings (vector match)
+
+All workers share the same Redis instance but listen on independent queues
+so they can be scaled and deployed separately.
+
+Auto-prepare (opt-in My Preferences) fans out Phase A on ``job_analysis`` and
+optionally Phase B on ``job_tailoring``. Under load, run a second analysis
+(and/or tailoring) process against the same Redis queues, and/or raise
+``analysis_worker_max_jobs`` / ``tailoring_worker_max_jobs`` in System Settings.
+Use ``auto_prepare_enabled`` / daily+pending caps to pause or throttle.
+"""
+import argparse
+import asyncio
+import sys
+from pathlib import Path
+
+# Load .env into os.environ BEFORE any app imports.
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+from app.core.logging import setup_logging, get_logger
+
+# Default until the concrete worker mode is known in ``main`` / startup hooks.
+setup_logging(service="worker")
+logger = get_logger(__name__)
+
+
+async def _start_worker_log_sink(service: str) -> None:
+    try:
+        from app.services.log_sink import start_log_sink
+
+        await start_log_sink(service=service)
+    except Exception as e:
+        logger.warning("log_sink_start_failed", service=service, error=str(e))
+
+
+async def _stop_worker_log_sink() -> None:
+    try:
+        from app.services.log_sink import stop_log_sink
+
+        await stop_log_sink()
+    except Exception:
+        pass
+
+# Proactor is already the default on modern Windows/Python; setting the
+# deprecated WindowsProactorEventLoopPolicy warns on 3.14+.
+if sys.platform == "win32" and sys.version_info < (3, 14):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
+
+if sys.platform != "win32":
+    try:
+        import uvloop
+
+        uvloop.install()
+    except ImportError:
+        pass
+
+from arq import run_worker
+from app.tasks.worker import (
+    ExtractionWorkerSettings,
+    AnalysisWorkerSettings,
+    TailoringWorkerSettings,
+    SaveWorkerSettings,
+    AutoPostWorkerSettings,
+    ResumeBuildWorkerSettings,
+    ScraperWorkerSettings,
+    EncodingWorkerSettings,
+    extract_job,
+    generate_tailored_content,
+    save_analyzed_job,
+    run_match_auto_posts_task,
+    build_resume_task,
+    run_scraper_task,
+    sync_user_job_sources_task,
+    sync_user_job_site_connections_task,
+)
+from app.storage.database import init_database, close_database
+from app.services.http_client import init_http_client, close_http_client
+from app.extractors.browser_extractor import (
+    init_browser_pool,
+    close_browser_pool,
+)
+
+# System Settings key that controls each worker's arq max_jobs.
+MODE_MAX_JOBS_SETTING = {
+    "extraction": "extraction_worker_max_jobs",
+    "analysis": "analysis_worker_max_jobs",
+    "tailoring": "tailoring_worker_max_jobs",
+    "save": "save_worker_max_jobs",
+    "autopost": "autopost_worker_max_jobs",
+    "resume": "resume_worker_max_jobs",
+    "scraper": "scraper_worker_max_jobs",
+    "encoding": "encoding_worker_max_jobs",
+}
+
+
+# ── Extraction worker lifecycle ────────────────────────────────────────────
+
+def _worker_pool(max_jobs_attr: str) -> dict:
+    """One DB connection per concurrent job (capped) plus a little overflow.
+
+    Sizing every process from one global DATABASE_POOL_SIZE either starves the
+    busy workers or, summed over the fleet, overruns Postgres max_connections.
+    """
+    from app.core.config import get_settings
+
+    jobs = int(getattr(get_settings(), max_jobs_attr, 4) or 4)
+    return {"pool_size": max(2, min(jobs, 10)), "max_overflow": 2}
+
+
+async def extraction_startup(ctx):
+    logger.info("extraction_worker_startup_begin")
+    await init_database(**_worker_pool("extraction_worker_max_jobs"))
+    await _start_worker_log_sink("extraction")
+    await init_http_client()
+    await init_browser_pool()
+    from app.services.extraction_cache import init_redis_pool
+    from app.core.redis_support import init_pubsub_redis_pool
+    from app.services.extraction_service import ExtractionService
+
+    await init_redis_pool()
+    await init_pubsub_redis_pool()
+    ctx["extraction_service"] = ExtractionService()
+    logger.info("extraction_worker_startup_complete")
+
+
+async def extraction_shutdown(ctx):
+    logger.info("extraction_worker_shutdown_begin")
+    await _stop_worker_log_sink()
+    await close_browser_pool()
+    await close_http_client()
+    from app.services.extraction_cache import close_redis_pool
+    from app.core.redis_support import close_pubsub_redis_pool
+
+    await close_pubsub_redis_pool()
+    await close_redis_pool()
+    await close_database()
+    logger.info("extraction_worker_shutdown_complete")
+
+
+# ── Analysis worker lifecycle (no browser/HTTP needed) ─────────────────────
+
+async def analysis_startup(ctx):
+    logger.info("analysis_worker_startup_begin")
+    await init_database(**_worker_pool("analysis_worker_max_jobs"))
+    await _start_worker_log_sink("analysis")
+    from app.services.extraction_cache import init_redis_pool
+    from app.core.redis_support import init_pubsub_redis_pool
+    from app.services.pipeline_health import heal_stale_pipeline_state
+
+    await init_redis_pool()
+    await init_pubsub_redis_pool()
+    await heal_stale_pipeline_state()
+    # Loading torch and the cross-encoder takes ~10 s; doing it before the
+    # worker takes jobs keeps that off the first matches' latency.
+    from app.services import cross_encoder
+
+    await asyncio.to_thread(cross_encoder.warm_up)
+    logger.info("analysis_worker_startup_complete")
+
+
+async def analysis_shutdown(ctx):
+    logger.info("analysis_worker_shutdown_begin")
+    await _stop_worker_log_sink()
+    from app.services.extraction_cache import close_redis_pool
+    from app.core.redis_support import close_pubsub_redis_pool
+
+    await close_pubsub_redis_pool()
+    await close_redis_pool()
+    await close_database()
+    logger.info("analysis_worker_shutdown_complete")
+
+
+async def tailoring_startup(ctx):
+    logger.info("tailoring_worker_startup_begin")
+    await init_database(**_worker_pool("tailoring_worker_max_jobs"))
+    await _start_worker_log_sink("tailoring")
+    from app.services.extraction_cache import init_redis_pool
+    from app.core.redis_support import init_pubsub_redis_pool
+    from app.services.pipeline_health import heal_stale_pipeline_state
+
+    await init_redis_pool()
+    await init_pubsub_redis_pool()
+    await heal_stale_pipeline_state()
+    logger.info("tailoring_worker_startup_complete")
+
+
+async def tailoring_shutdown(ctx):
+    logger.info("tailoring_worker_shutdown_begin")
+    await _stop_worker_log_sink()
+    from app.services.extraction_cache import close_redis_pool
+    from app.core.redis_support import close_pubsub_redis_pool
+
+    await close_pubsub_redis_pool()
+    await close_redis_pool()
+    await close_database()
+    logger.info("tailoring_worker_shutdown_complete")
+
+
+# ── arq config classes ─────────────────────────────────────────────────────
+# arq's get_kwargs reads __dict__ (own attrs only), so every setting used
+# by the Worker must appear directly on the concrete config class.
+
+from app.core.config import get_settings as _get_settings
+
+_MATCH_POLL_DELAY = _get_settings().match_worker_poll_delay_seconds
+
+class ExtractionWorkerConfig(ExtractionWorkerSettings):
+    on_startup = extraction_startup
+    on_shutdown = extraction_shutdown
+    functions = [extract_job]
+    queue_name = ExtractionWorkerSettings.queue_name
+    job_timeout = ExtractionWorkerSettings.job_timeout
+    max_jobs = ExtractionWorkerSettings.max_jobs
+    max_tries = ExtractionWorkerSettings.max_tries
+    keep_result = ExtractionWorkerSettings.keep_result
+    redis_settings = ExtractionWorkerSettings.redis_settings()
+    poll_delay = _MATCH_POLL_DELAY
+
+
+class AnalysisWorkerConfig(AnalysisWorkerSettings):
+    on_startup = analysis_startup
+    on_shutdown = analysis_shutdown
+    functions = list(AnalysisWorkerSettings.functions)
+    queue_name = AnalysisWorkerSettings.queue_name
+    job_timeout = AnalysisWorkerSettings.job_timeout
+    max_jobs = AnalysisWorkerSettings.max_jobs
+    max_tries = AnalysisWorkerSettings.max_tries
+    keep_result = AnalysisWorkerSettings.keep_result
+    redis_settings = AnalysisWorkerSettings.redis_settings()
+    poll_delay = _MATCH_POLL_DELAY
+
+
+class TailoringWorkerConfig(TailoringWorkerSettings):
+    on_startup = tailoring_startup
+    on_shutdown = tailoring_shutdown
+    functions = [generate_tailored_content]
+    queue_name = TailoringWorkerSettings.queue_name
+    job_timeout = TailoringWorkerSettings.job_timeout
+    max_jobs = TailoringWorkerSettings.max_jobs
+    max_tries = TailoringWorkerSettings.max_tries
+    keep_result = TailoringWorkerSettings.keep_result
+    redis_settings = TailoringWorkerSettings.redis_settings()
+
+
+async def save_startup(ctx):
+    logger.info("save_worker_startup_begin")
+    await init_database(**_worker_pool("save_worker_max_jobs"))
+    await _start_worker_log_sink("save")
+    from app.core.redis_support import init_pubsub_redis_pool
+
+    await init_pubsub_redis_pool()
+    logger.info("save_worker_startup_complete")
+
+
+async def save_shutdown(ctx):
+    logger.info("save_worker_shutdown_begin")
+    await _stop_worker_log_sink()
+    from app.core.redis_support import close_pubsub_redis_pool
+
+    await close_pubsub_redis_pool()
+    await close_database()
+    logger.info("save_worker_shutdown_complete")
+
+
+class SaveWorkerConfig(SaveWorkerSettings):
+    on_startup = save_startup
+    on_shutdown = save_shutdown
+    functions = [save_analyzed_job]
+    queue_name = SaveWorkerSettings.queue_name
+    job_timeout = SaveWorkerSettings.job_timeout
+    max_jobs = SaveWorkerSettings.max_jobs
+    max_tries = SaveWorkerSettings.max_tries
+    keep_result = SaveWorkerSettings.keep_result
+    redis_settings = SaveWorkerSettings.redis_settings()
+    poll_delay = _MATCH_POLL_DELAY
+
+
+async def autopost_startup(ctx):
+    logger.info("autopost_worker_startup_begin")
+    await init_database(**_worker_pool("autopost_worker_max_jobs"))
+    await _start_worker_log_sink("autopost")
+    from app.core.redis_support import init_pubsub_redis_pool
+
+    await init_pubsub_redis_pool()
+    logger.info("autopost_worker_startup_complete")
+
+
+async def autopost_shutdown(ctx):
+    logger.info("autopost_worker_shutdown_begin")
+    await _stop_worker_log_sink()
+    from app.core.redis_support import close_pubsub_redis_pool
+
+    await close_pubsub_redis_pool()
+    await close_database()
+    logger.info("autopost_worker_shutdown_complete")
+
+
+class AutoPostWorkerConfig(AutoPostWorkerSettings):
+    on_startup = autopost_startup
+    on_shutdown = autopost_shutdown
+    functions = [run_match_auto_posts_task]
+    queue_name = AutoPostWorkerSettings.queue_name
+    job_timeout = AutoPostWorkerSettings.job_timeout
+    max_jobs = AutoPostWorkerSettings.max_jobs
+    max_tries = AutoPostWorkerSettings.max_tries
+    keep_result = AutoPostWorkerSettings.keep_result
+    redis_settings = AutoPostWorkerSettings.redis_settings()
+
+
+# ── Resume build worker lifecycle (DB only, no browser/HTTP) ───────────────
+
+async def resume_build_startup(ctx):
+    logger.info("resume_build_worker_startup_begin")
+    await init_database(**_worker_pool("resume_worker_max_jobs"))
+    await _start_worker_log_sink("resume")
+    from app.core.redis_support import init_pubsub_redis_pool
+
+    await init_pubsub_redis_pool()
+    logger.info("resume_build_worker_startup_complete")
+
+
+async def resume_build_shutdown(ctx):
+    logger.info("resume_build_worker_shutdown_begin")
+    await _stop_worker_log_sink()
+    from app.core.redis_support import close_pubsub_redis_pool
+
+    await close_pubsub_redis_pool()
+    await close_database()
+    logger.info("resume_build_worker_shutdown_complete")
+
+
+class ResumeBuildWorkerConfig(ResumeBuildWorkerSettings):
+    on_startup = resume_build_startup
+    on_shutdown = resume_build_shutdown
+    functions = [build_resume_task]
+    queue_name = ResumeBuildWorkerSettings.queue_name
+    job_timeout = ResumeBuildWorkerSettings.job_timeout
+    max_jobs = ResumeBuildWorkerSettings.max_jobs
+    max_tries = ResumeBuildWorkerSettings.max_tries
+    keep_result = ResumeBuildWorkerSettings.keep_result
+    redis_settings = ResumeBuildWorkerSettings.redis_settings()
+
+
+# ── Scraper worker lifecycle (DB only - spiders run as subprocesses) ───────
+
+async def scraper_startup(ctx):
+    logger.info("scraper_worker_startup_begin")
+    await init_database(**_worker_pool("scraper_worker_max_jobs"))
+    await _start_worker_log_sink("scraper")
+    from app.core.redis_support import init_pubsub_redis_pool
+
+    await init_pubsub_redis_pool()
+    logger.info("scraper_worker_startup_complete")
+
+
+async def scraper_shutdown(ctx):
+    logger.info("scraper_worker_shutdown_begin")
+    await _stop_worker_log_sink()
+    from app.core.redis_support import close_pubsub_redis_pool
+
+    await close_pubsub_redis_pool()
+    await close_database()
+    logger.info("scraper_worker_shutdown_complete")
+
+
+class ScraperWorkerConfig(ScraperWorkerSettings):
+    on_startup = scraper_startup
+    on_shutdown = scraper_shutdown
+    functions = [run_scraper_task, sync_user_job_sources_task, sync_user_job_site_connections_task]
+    cron_jobs = ScraperWorkerSettings.cron_jobs
+    queue_name = ScraperWorkerSettings.queue_name
+    job_timeout = ScraperWorkerSettings.job_timeout
+    max_jobs = ScraperWorkerSettings.max_jobs
+    max_tries = ScraperWorkerSettings.max_tries
+    keep_result = ScraperWorkerSettings.keep_result
+    redis_settings = ScraperWorkerSettings.redis_settings()
+
+
+# ── Encoding worker lifecycle (DB + embedding model, no browser/HTTP) ───────
+
+async def encoding_startup(ctx):
+    logger.info("encoding_worker_startup_begin")
+    await init_database(**_worker_pool("encoding_worker_max_jobs"))
+    await _start_worker_log_sink("encoding")
+    from app.core.redis_support import init_pubsub_redis_pool
+
+    await init_pubsub_redis_pool()
+    # Blocking model load (first run downloads weights into the cache dir).
+    from app.services.encoding_service import get_embedding_model
+
+    await asyncio.get_running_loop().run_in_executor(None, get_embedding_model)
+    logger.info("encoding_worker_startup_complete")
+
+
+async def encoding_shutdown(ctx):
+    logger.info("encoding_worker_shutdown_begin")
+    await _stop_worker_log_sink()
+    from app.core.redis_support import close_pubsub_redis_pool
+
+    await close_pubsub_redis_pool()
+    await close_database()
+    logger.info("encoding_worker_shutdown_complete")
+
+
+class EncodingWorkerConfig(EncodingWorkerSettings):
+    on_startup = encoding_startup
+    on_shutdown = encoding_shutdown
+    functions = EncodingWorkerSettings.functions
+    queue_name = EncodingWorkerSettings.queue_name
+    job_timeout = EncodingWorkerSettings.job_timeout
+    max_jobs = EncodingWorkerSettings.max_jobs
+    max_tries = EncodingWorkerSettings.max_tries
+    keep_result = EncodingWorkerSettings.keep_result
+    redis_settings = EncodingWorkerSettings.redis_settings()
+    poll_delay = _MATCH_POLL_DELAY
+
+
+WORKER_CONFIGS = {
+    "extraction": ExtractionWorkerConfig,
+    "analysis": AnalysisWorkerConfig,
+    "tailoring": TailoringWorkerConfig,
+    "save": SaveWorkerConfig,
+    "autopost": AutoPostWorkerConfig,
+    "resume": ResumeBuildWorkerConfig,
+    "scraper": ScraperWorkerConfig,
+    "encoding": EncodingWorkerConfig,
+}
+
+
+# Owned by the worker process so we never call deprecated
+# ``asyncio.get_event_loop()`` when no loop is set (Python 3.12+ warning).
+_MAIN_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _install_main_event_loop() -> asyncio.AbstractEventLoop:
+    """Ensure MainThread has an open loop for arq.
+
+    arq ``Worker.__init__`` calls ``asyncio.get_event_loop()``. On Python 3.12+
+    that warns/raises if no loop is set. ``asyncio.run()`` also closes its loop
+    when finished, so any pre-start async work must leave a live loop installed
+    via ``set_event_loop``, without calling the deprecated getter first.
+    """
+    global _MAIN_EVENT_LOOP
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    if _MAIN_EVENT_LOOP is not None and not _MAIN_EVENT_LOOP.is_closed():
+        asyncio.set_event_loop(_MAIN_EVENT_LOOP)
+        return _MAIN_EVENT_LOOP
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _MAIN_EVENT_LOOP = loop
+    return loop
+
+
+def _apply_effective_max_jobs(mode: str, config_cls: type) -> int:
+    """Load System Settings override for max_jobs before arq Worker starts."""
+    setting_key = MODE_MAX_JOBS_SETTING[mode]
+
+    async def _load() -> int:
+        await init_database()
+        try:
+            from app.services.system_settings_service import (
+                get_effective_value,
+                invalidate_system_settings_cache,
+            )
+
+            invalidate_system_settings_cache()
+            value = await get_effective_value(setting_key)
+            return max(1, int(value))
+        finally:
+            await close_database()
+
+    # Use a persistent loop (do not asyncio.run): arq needs get_event_loop()
+    # immediately after this returns.
+    loop = _install_main_event_loop()
+    try:
+        max_jobs = loop.run_until_complete(_load())
+    except Exception as exc:
+        max_jobs = max(1, int(getattr(config_cls, "max_jobs", 10) or 10))
+        logger.warning(
+            "worker_max_jobs_settings_load_failed",
+            mode=mode,
+            setting=setting_key,
+            fallback=max_jobs,
+            error=str(exc),
+        )
+    # Belt-and-suspenders: if anything closed the loop during load, reinstall.
+    _install_main_event_loop()
+    config_cls.max_jobs = max_jobs
+    logger.info(
+        "worker_max_jobs_applied",
+        mode=mode,
+        setting=setting_key,
+        max_jobs=max_jobs,
+    )
+    return max_jobs
+
+
+# IMPORTANT: this function MUST stay at module scope.
+#
+# `watchfiles.run_process` uses ``multiprocessing.get_context('spawn').Process``,
+# which is the only available start method on Windows. ``spawn`` pickles the
+# target callable by ``(module, qualname)``; the child re-imports the module
+# (as ``__mp_main__``) and looks the function up by name on that module.
+#
+# A function defined inside ``if __name__ == "__main__":`` is never bound on
+# ``__mp_main__`` (the guard is False during the spawn re-import), so unpickling
+# fails with::
+#
+#     AttributeError: Can't get attribute '<func>' on
+#     <module '__mp_main__' from 'run_worker.py'>
+#
+# Keep this defined at module level and accept the worker mode as a plain
+# string so pickling stores just ``(run_worker, _watchfiles_worker_target)``
+# plus a str arg - both trivially importable in the spawned child.
+def _watchfiles_worker_target(mode: str) -> None:
+    config = WORKER_CONFIGS[mode]
+    _apply_effective_max_jobs(mode, config)
+    _install_main_event_loop()
+    logger.info(
+        "worker_process_starting",
+        mode=mode,
+        queue=config.queue_name,
+        max_jobs=config.max_jobs,
+    )
+    run_worker(config)
+
+
+if __name__ == "__main__":
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(
+        description="Start an arq worker for one pipeline.",
+    )
+    parser.add_argument(
+        "mode",
+        choices=list(WORKER_CONFIGS.keys()),
+        help=(
+            "Which pipeline to run: extraction | analysis | tailoring | "
+            "save | autopost | resume | scraper | encoding."
+        ),
+    )
+    args = parser.parse_args()
+    config = WORKER_CONFIGS[args.mode]
+    max_jobs = _apply_effective_max_jobs(args.mode, config)
+    logger.info(
+        "worker_launching",
+        mode=args.mode,
+        queue=config.queue_name,
+        max_jobs=max_jobs,
+    )
+
+    from app.core.dev_reload import worker_reload_enabled
+
+    if worker_reload_enabled():
+        from watchfiles import run_process
+        from watchfiles.filters import PythonFilter
+
+        watch_path = str(Path(__file__).resolve().parent / "app")
+        print(
+            f"[reload] Watching {watch_path} - {args.mode} worker restarts on .py changes "
+            f"(debounced). Set WORKER_RELOAD=0 for a stable worker."
+        )
+        run_process(
+            watch_path,
+            target=_watchfiles_worker_target,
+            args=(args.mode,),
+            watch_filter=PythonFilter(),
+            debounce=5_000,
+            grace_period=3.0,
+        )
+    else:
+        print(
+            f"[worker] {args.mode} on queue '{config.queue_name}' "
+            f"max_jobs={max_jobs} "
+            f"(hot-reload off; set WORKER_RELOAD=1 to watch app/)"
+        )
+        _install_main_event_loop()
+        run_worker(config)
